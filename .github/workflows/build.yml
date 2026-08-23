@@ -1,0 +1,41 @@
+name: Build GoW Overlay
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "assets/**"
+      - "build.ps1"
+      - "version_info.txt"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build executable
+        shell: powershell
+        run: .\build.ps1
+
+      - name: Upload unsigned executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoW-Overlay-unsigned
+          path: dist/GoW Overlay.exe
+          if-no-files-found: error
+          retention-days: 14
