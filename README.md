@@ -16,6 +16,7 @@ GoW Overlay is a Windows utility that combines a Twitch chat overlay with automa
 - Supports multiple monitors and proportionally scales the overlay from a 1920×1080 reference layout.
 - Includes configurable font, opacity, spacing, dimensions, position and message behavior.
 - Keeps the Settings and Live Control windows out of OBS capture when supported by Windows.
+- Provides a system-tray icon with quick access to Live Control, Settings and Exit.
 
 ### Requirements
 
@@ -100,6 +101,7 @@ O GoW Overlay é um utilitário para Windows que combina um overlay do chat da T
 - Suporta vários monitores e redimensiona proporcionalmente o overlay a partir de um layout-base de 1920×1080.
 - Permite configurar fonte, opacidade, espaçamento, dimensões, posição e comportamento das mensagens.
 - Mantém as janelas de Configurações e Live Control fora da captura do OBS quando o Windows oferece suporte.
+- Oferece um ícone na bandeja do sistema, com acesso rápido ao Live Control, às Configurações e à opção Sair.
 
 ### Requisitos
 
