@@ -180,6 +180,22 @@ Este projeto é distribuído sob a licença MIT.
 
 Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
 
-- Committer and reviewer: [plxxxq](https://github.com/plxxxq)
+**Status:** Application pending. Current release artifacts remain unsigned until the project is approved.
+
+### Signed artifacts
+
+Only Windows release artifacts built from this repository by GitHub Actions will be submitted for signing. Each signing request must be approved by the project approver. Private signing keys are managed by SignPath and are not stored in this repository.
+
+### Team roles
+
+- Author and committer: [plxxxq](https://github.com/plxxxq)
+- Reviewer: [plxxxq](https://github.com/plxxxq)
 - Approver: [plxxxq](https://github.com/plxxxq)
-- Privacy: this program communicates only with Twitch services authorized by the user and the user-configured local OBS WebSocket server. It does not transfer information to other networked systems unless specifically requested by the user or the person operating it.
+
+As a single-maintainer project, changes submitted by external contributors must be reviewed by the maintainer before being merged.
+
+### Privacy
+
+This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
+
+The application communicates only with Twitch services authorized by the user and the user-configured local OBS WebSocket server. Twitch tokens and application settings are stored locally in `%LOCALAPPDATA%\GoW Overlay`.
