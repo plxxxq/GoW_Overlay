@@ -5,8 +5,12 @@ $scriptFile = Join-Path $projectDir "src\gow_overlay.py"
 $iconFile = Join-Path $projectDir "assets\GoW_Overlay.ico"
 $splashFile = Join-Path $projectDir "assets\GoW_Overlay.png"
 $versionFile = Join-Path $projectDir "version_info.txt"
-$desktopDir = [Environment]::GetFolderPath("Desktop")
-$outputDir = Join-Path $desktopDir "GoW Overlay"
+if ($env:GITHUB_ACTIONS -eq "true") {
+    $outputDir = Join-Path $projectDir "dist"
+} else {
+    $desktopDir = [Environment]::GetFolderPath("Desktop")
+    $outputDir = Join-Path $desktopDir "GoW Overlay"
+}
 $buildDir = Join-Path $env:TEMP "GoW_Overlay_build"
 $specDir = Join-Path $env:TEMP "GoW_Overlay_spec"
 
@@ -48,4 +52,6 @@ if (-not (Test-Path $exeFile)) {
 Write-Host ""
 Write-Host "EXE criado com sucesso:" -ForegroundColor Green
 Write-Host $exeFile -ForegroundColor Cyan
-Start-Process explorer.exe "/select,`"$exeFile`""
+if ($env:GITHUB_ACTIONS -ne "true") {
+    Start-Process explorer.exe "/select,`"$exeFile`""
+}

@@ -65,6 +65,16 @@ Twitch authorization uses Twitch's official device authorization flow. The appli
 
 `tokens.txt` and `config.json` are excluded from the repository through `.gitignore`.
 
+The application communicates with Twitch services only after the user authorizes the requested features. OBS communication is restricted to the local WebSocket server configured by the user. See the [Twitch Privacy Notice](https://www.twitch.tv/p/en/legal/privacy-notice/).
+
+### Uninstallation
+
+GoW Overlay is portable and does not include an installer. Delete `GoW Overlay.exe`, then optionally remove the following folder to erase locally stored settings and Twitch tokens:
+
+```text
+%LOCALAPPDATA%\GoW Overlay
+```
+
 ### Project structure
 
 ```text
@@ -139,6 +149,16 @@ A autorização utiliza o fluxo oficial de dispositivos da Twitch. O aplicativo 
 
 Os arquivos `tokens.txt` e `config.json` são excluídos do repositório pelo `.gitignore`.
 
+O aplicativo se comunica com os serviços da Twitch somente depois que o usuário autoriza os recursos solicitados. A comunicação com o OBS fica restrita ao servidor WebSocket local configurado pelo usuário. Consulte o [Aviso de Privacidade da Twitch](https://www.twitch.tv/p/en/legal/privacy-notice/).
+
+### Desinstalação
+
+O GoW Overlay é portátil e não utiliza instalador. Exclua o arquivo `GoW Overlay.exe` e, opcionalmente, remova a pasta abaixo para apagar as configurações locais e os tokens da Twitch:
+
+```text
+%LOCALAPPDATA%\GoW Overlay
+```
+
 ### Estrutura do projeto
 
 ```text
@@ -153,3 +173,11 @@ version_info.txt     Metadados do executável no Windows
 This project is licensed under the MIT License.
 
 Este projeto é distribuído sob a licença MIT.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+- Committer and reviewer: [plxxxq](https://github.com/plxxxq)
+- Approver: [plxxxq](https://github.com/plxxxq)
+- Privacy: this program communicates only with Twitch services authorized by the user and the user-configured local OBS WebSocket server. It does not transfer information to other networked systems unless specifically requested by the user or the person operating it.
