@@ -294,7 +294,7 @@ def monitor_scale(monitor_number, rects=None):
     return max(0.25, min(width_scale, height_scale))
 
 DEFAULT_CONFIG = {
-    "config_version": 64,
+    "config_version": 66,
     "settings_scale": 1.0,
     "channel": "",
     "obs_source": "DP",
@@ -429,7 +429,7 @@ SHOW_STARTUP_INFO = bool(config.get("show_startup_info", True))
 
 def save_config():
     data = {
-        "config_version": 64,
+        "config_version": 66,
         "settings_scale": CURRENT_SETTINGS_SCALE,
         "channel": CHANNEL_LOGIN,
         "obs_source": SOURCE_NAME,
@@ -3106,6 +3106,8 @@ def open_support():
 
 
 def quit_program():
+    stop_tray_icon()
+
     try:
         set_dp(False)
     except Exception:
@@ -3676,6 +3678,84 @@ def refresh_dashboard():
     )
 
 
+# =========================================================
+# ÍCONE DA BANDEJA
+# =========================================================
+
+tray_icon = None
+
+
+def show_dashboard_from_tray():
+    global dashboard_panel_visible
+
+    dashboard_panel_visible = True
+    try:
+        dashboard.deiconify()
+        dashboard.attributes("-topmost", True)
+        dashboard.overrideredirect(True)
+        dashboard.lift()
+        dashboard.focus_force()
+        reapply_dashboard_capture_protection()
+        refresh_dashboard()
+        apply_overlay_visibility()
+    except Exception as error:
+        log(f"Erro ao abrir Live Control pela bandeja: {error}")
+
+
+def stop_tray_icon():
+    global tray_icon
+
+    icon = tray_icon
+    tray_icon = None
+    if icon is not None:
+        try:
+            icon.stop()
+        except Exception:
+            pass
+
+
+def start_tray_icon():
+    global tray_icon
+
+    if tray_icon is not None:
+        return
+
+    try:
+        tray_image = Image.open(ICON_FILE).convert("RGBA")
+    except Exception:
+        tray_image = Image.open(SPLASH_IMAGE_FILE).convert("RGBA")
+
+    def request(action):
+        def callback(_icon=None, _item=None):
+            queue_ui(action)
+        return callback
+
+    tray_menu = pystray.Menu(
+        pystray.MenuItem(
+            "Abrir Live Control",
+            request("tray_dashboard"),
+            default=True
+        ),
+        pystray.MenuItem(
+            "Configurações",
+            request("tray_settings")
+        ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "Sair",
+            request("tray_quit")
+        )
+    )
+
+    tray_icon = pystray.Icon(
+        "gow_overlay",
+        tray_image,
+        "GoW Overlay",
+        tray_menu
+    )
+    tray_icon.run_detached()
+
+
 def process_ui_queue():
     changed = False
 
@@ -3688,6 +3768,16 @@ def process_ui_queue():
                 log_text.insert("end", value + "\n")
                 log_text.see("end")
                 log_text.configure(state="disabled")
+
+            elif kind == "tray_dashboard":
+                show_dashboard_from_tray()
+
+            elif kind == "tray_settings":
+                open_settings()
+
+            elif kind == "tray_quit":
+                quit_program()
+                return
 
             changed = True
 
@@ -6188,5 +6278,7 @@ update_focus()
 dashboard_panel_visible = False
 
 dashboard.withdraw()
+
+start_tray_icon()
 
 root.mainloop()
