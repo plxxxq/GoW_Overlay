@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.spec
+build/
+dist/
+tokens.txt
+config.json
+*.pfx
+*.p12
+*.cer
