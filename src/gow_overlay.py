@@ -4,12 +4,17 @@ import json
 import time
 import queue
 import ctypes
+from ctypes import wintypes
 import threading
 import subprocess
 import webbrowser
 import io
 import re
 import socket
+import hmac
+import secrets
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
@@ -24,6 +29,11 @@ import obsws_python as obs
 
 import pystray
 from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageSequence
+
+try:
+    import qrcode
+except ImportError:
+    qrcode = None
 
 
 
@@ -48,6 +58,14 @@ WDA_EXCLUDEFROMCAPTURE = 0x00000011
 REQUIRED_CHAT_SCOPE = "user:read:chat"
 REQUIRED_REWARD_SCOPE = "channel:read:redemptions"
 REQUIRED_SUB_SCOPE = "channel:read:subscriptions"
+REQUIRED_BITS_SCOPE = "bits:read"
+
+REQUIRED_TWITCH_SCOPES = (
+    REQUIRED_CHAT_SCOPE,
+    REQUIRED_REWARD_SCOPE,
+    REQUIRED_SUB_SCOPE,
+    REQUIRED_BITS_SCOPE,
+)
 
 
 # =========================================================
@@ -124,6 +142,7 @@ for old_name, new_path in (
 # =========================================================
 
 splash = tk.Tk()
+splash.title("GoW Overlay")
 splash.overrideredirect(True)
 splash.configure(bg="#121212")
 splash.attributes("-topmost", True)
@@ -294,7 +313,7 @@ def monitor_scale(monitor_number, rects=None):
     return max(0.25, min(width_scale, height_scale))
 
 DEFAULT_CONFIG = {
-    "config_version": 66,
+    "config_version": 67,
     "settings_scale": 1.0,
     "channel": "",
     "obs_source": "DP",
@@ -313,6 +332,9 @@ DEFAULT_CONFIG = {
     "control_dp": True,
     "show_chat": True,
     "animate_emotes": True,
+    "third_party_emotes": True,
+    "log_to_file": True,
+    "show_hint": True,
     "f9_initial_time": 2,
     "f9_repeat_time": 1.5,
     "always_show_overlay": False,
@@ -411,6 +433,9 @@ OVERLAY_MONITOR = max(1, int(config.get("overlay_monitor", 1)))
 CONTROL_DP = bool(config.get("control_dp", True))
 SHOW_CHAT = bool(config.get("show_chat", True))
 ANIMATE_EMOTES = bool(config.get("animate_emotes", True))
+THIRD_PARTY_EMOTES = bool(config.get("third_party_emotes", True))
+LOG_TO_FILE = bool(config.get("log_to_file", True))
+SHOW_HINT = bool(config.get("show_hint", True))
 CURRENT_SETTINGS_SCALE = float(
     config.get("settings_scale", monitor_scale(OVERLAY_MONITOR))
 )
@@ -429,7 +454,7 @@ SHOW_STARTUP_INFO = bool(config.get("show_startup_info", True))
 
 def save_config():
     data = {
-        "config_version": 66,
+        "config_version": 67,
         "settings_scale": CURRENT_SETTINGS_SCALE,
         "channel": CHANNEL_LOGIN,
         "obs_source": SOURCE_NAME,
@@ -448,6 +473,9 @@ def save_config():
         "control_dp": CONTROL_DP,
         "show_chat": SHOW_CHAT,
         "animate_emotes": ANIMATE_EMOTES,
+        "third_party_emotes": THIRD_PARTY_EMOTES,
+        "log_to_file": LOG_TO_FILE,
+        "show_hint": SHOW_HINT,
         "f9_initial_time": F9_INITIAL_TIME,
         "f9_repeat_time": F9_REPEAT_TIME,
         "always_show_overlay": ALWAYS_SHOW_OVERLAY,
@@ -546,7 +574,8 @@ def show_startup_information():
         info_window,
         text=(
             "Quando necessário, a Twitch abrirá no navegador para autorizar "
-            "apenas a leitura do chat, resgates de pontos e inscrições. O "
+            "apenas a leitura do chat, resgates de pontos, inscrições e "
+            "Cheers/Bits. O "
             "overlay não acessa sua senha, e os tokens ficam salvos somente "
             "neste computador."
         ),
@@ -845,11 +874,7 @@ def device_login():
     """Login universal da Twitch sem exigir tokens.txt nem client secret."""
     global ACCESS_TOKEN, REFRESH_TOKEN
 
-    scopes = " ".join((
-        REQUIRED_CHAT_SCOPE,
-        REQUIRED_REWARD_SCOPE,
-        REQUIRED_SUB_SCOPE,
-    ))
+    scopes = " ".join(REQUIRED_TWITCH_SCOPES)
 
     try:
         response = requests.post(
@@ -942,9 +967,26 @@ validation = (
     if ACCESS_TOKEN else None
 )
 
+
+def token_has_required_scopes(validation_data):
+    if not validation_data:
+        return False
+
+    granted_scopes = set(validation_data.get("scopes", []))
+    return set(REQUIRED_TWITCH_SCOPES).issubset(granted_scopes)
+
 # Tokens pertencem ao Client ID que os criou. Ao atualizar o aplicativo da
 # Twitch, ignora automaticamente tokens antigos e solicita uma nova autorização.
 if validation is not None and validation.get("client_id") != CLIENT_ID:
+    validation = None
+    ACCESS_TOKEN = ""
+    REFRESH_TOKEN = ""
+
+# Novas versões podem solicitar recursos adicionais. Um refresh token não
+# consegue ampliar permissões já concedidas, então o aplicativo abre o fluxo
+# oficial de autorização novamente quando faltar algum scope obrigatório.
+if validation is not None and not token_has_required_scopes(validation):
+    splash_status("Atualizando permissões da Twitch...")
     validation = None
     ACCESS_TOKEN = ""
     REFRESH_TOKEN = ""
@@ -958,6 +1000,11 @@ if validation is None:
             65
         )
 
+        if validation is not None and not token_has_required_scopes(validation):
+            validation = None
+            ACCESS_TOKEN = ""
+            REFRESH_TOKEN = ""
+
     if validation is None:
         splash_status("Aguardando autorização da Twitch...")
         logged_in = run_while_splash_moves(device_login, 82)
@@ -966,6 +1013,9 @@ if validation is None:
                 lambda: validate_token(ACCESS_TOKEN),
                 85
             )
+
+            if not token_has_required_scopes(validation):
+                validation = None
 
     if validation is None:
         ctypes.windll.user32.MessageBoxW(
@@ -1034,14 +1084,20 @@ state = {
     "chat": False,
     "rewards": False,
     "subs": False,
+    "raids": False,
+    "bits": False,
 
     "last_message": "-",
     "last_reward": "-",
     "last_sub": "-",
+    "last_raid": "-",
+    "last_bits": "-",
 
     "chat_count": 0,
     "reward_count": 0,
-    "sub_count": 0
+    "sub_count": 0,
+    "raid_count": 0,
+    "bits_count": 0
 }
 
 ui_queue = queue.Queue()
@@ -1051,9 +1107,73 @@ def queue_ui(kind, value=None):
     ui_queue.put((kind, value))
 
 
+LOG_DIR = os.path.join(DATA_DIR, "Logs")
+LOG_FILE_PREFIX = "overlay_"
+LOG_FILE_SUFFIX = ".log"
+LOG_MAX_FILES = 10
+LOG_MAX_BYTES = 20_000_000  # trava de segurança por sessão
+
+# Um arquivo por uso do aplicativo, criado só quando a primeira linha é gravada.
+LOG_FILE = os.path.join(
+    LOG_DIR,
+    f"{LOG_FILE_PREFIX}{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    f"{LOG_FILE_SUFFIX}"
+)
+_log_file_ready = False
+_log_file_full = False
+
+
+def _prune_old_logs():
+    """Mantém no máximo LOG_MAX_FILES arquivos, apagando os mais antigos."""
+    try:
+        names = sorted(
+            name for name in os.listdir(LOG_DIR)
+            if name.startswith(LOG_FILE_PREFIX)
+            and name.endswith(LOG_FILE_SUFFIX)
+            and os.path.join(LOG_DIR, name) != LOG_FILE
+        )
+        # O arquivo desta sessão também conta no limite.
+        excess = len(names) - (LOG_MAX_FILES - 1)
+        for name in names[:max(0, excess)]:
+            try:
+                os.remove(os.path.join(LOG_DIR, name))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _write_log_file(line):
+    """Grava o log em disco para ele sobreviver ao fechamento do app."""
+    global _log_file_ready, _log_file_full
+
+    if not LOG_TO_FILE or _log_file_full:
+        return
+
+    try:
+        if not _log_file_ready:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            _prune_old_logs()
+            _log_file_ready = True
+
+        if (
+            os.path.exists(LOG_FILE)
+            and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES
+        ):
+            _log_file_full = True
+            line = "Log desta sessão atingiu o tamanho máximo; parando de gravar"
+
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
 def log(text):
-    stamp = datetime.now().strftime("%H:%M:%S")
+    now = datetime.now()
+    stamp = now.strftime("%H:%M:%S")
     queue_ui("log", f"{stamp}  {text}")
+    _write_log_file(f"{now.strftime('%Y-%m-%d %H:%M:%S')}  {text}")
 
 
 # =========================================================
@@ -1398,6 +1518,7 @@ root.withdraw()
 # =========================================================
 
 hint_root = tk.Toplevel(root)
+hint_root.title("GoW Overlay - Dica")
 hint_root.withdraw()
 hint_root.overrideredirect(True)
 hint_root.attributes("-topmost", True)
@@ -1472,30 +1593,385 @@ EMOTE_CACHE = {}
 EMOTE_PHOTO_CACHE = {}
 EMOTE_LOCK = threading.Lock()
 ACTIVE_EMOTE_ANIMATIONS = []
+THIRD_PARTY_EMOTE_GLOBALS = {}
+THIRD_PARTY_EMOTE_CHANNEL = {}
+THIRD_PARTY_EMOTE_LOCK = threading.Lock()
+THIRD_PARTY_EMOTES_LOADING = False
+THIRD_PARTY_EMOTES_LOADED = False
+
+THIRD_PARTY_PROVIDER_PRIORITY = {
+    "FFZ": 1,
+    "BTTV": 2,
+    "7TV": 3
+}
 
 
-def _download_emote(emote_id, animated=False):
-    """Baixa e cacheia um emote oficial da Twitch."""
-    if not emote_id:
+def _absolute_emote_url(url):
+    url = str(url or "").strip()
+    if url.startswith("//"):
+        return "https:" + url
+    return url
+
+
+def _best_scaled_url(urls):
+    if not isinstance(urls, dict):
+        return ""
+
+    for scale in ("2", "4", "3", "1"):
+        if urls.get(scale):
+            return _absolute_emote_url(urls[scale])
+
+    for url in urls.values():
+        if url:
+            return _absolute_emote_url(url)
+
+    return ""
+
+
+def _register_third_party_emotes(emotes, channel=False):
+    target = THIRD_PARTY_EMOTE_CHANNEL if channel else THIRD_PARTY_EMOTE_GLOBALS
+
+    with THIRD_PARTY_EMOTE_LOCK:
+        for emote in emotes:
+            code = str(emote.get("code") or "")
+            if not code:
+                continue
+
+            current = target.get(code)
+            new_priority = THIRD_PARTY_PROVIDER_PRIORITY.get(
+                emote.get("provider"),
+                0
+            )
+            current_priority = THIRD_PARTY_PROVIDER_PRIORITY.get(
+                current.get("provider") if current else None,
+                -1
+            )
+
+            if current is None or new_priority >= current_priority:
+                target[code] = emote
+
+
+def _bttv_emotes(payload):
+    if not isinstance(payload, list):
+        return []
+
+    emotes = []
+
+    for item in payload:
+        if not isinstance(item, dict) or item.get("modifier"):
+            continue
+
+        emote_id = str(item.get("id") or "")
+        code = str(item.get("code") or "")
+        if not emote_id or not code:
+            continue
+
+        emotes.append({
+            "kind": "emote",
+            "id": f"bttv:{emote_id}",
+            "source_id": emote_id,
+            "code": code,
+            "provider": "BTTV",
+            "third_party": True,
+            "animated": bool(item.get("animated"))
+            or str(item.get("imageType", "")).lower() == "gif",
+            "url": f"https://cdn.betterttv.net/emote/{emote_id}/2x",
+            "fallback_url": f"https://cdn.betterttv.net/emote/{emote_id}/1x"
+        })
+
+    return emotes
+
+
+def _ffz_emotes(payload, global_sets=False):
+    if not isinstance(payload, dict):
+        return []
+
+    sets = payload.get("sets", {})
+    if not isinstance(sets, dict):
+        return []
+
+    allowed_sets = None
+    if global_sets:
+        allowed_sets = {
+            str(set_id)
+            for set_id in payload.get("default_sets", [])
+        }
+
+    emotes = []
+
+    for set_id, emote_set in sets.items():
+        if allowed_sets is not None and str(set_id) not in allowed_sets:
+            continue
+        if not isinstance(emote_set, dict):
+            continue
+
+        for item in emote_set.get("emoticons", []):
+            if not isinstance(item, dict) or item.get("modifier"):
+                continue
+
+            emote_id = str(item.get("id") or "")
+            code = str(item.get("name") or "")
+            animated_urls = item.get("animated") or {}
+            static_urls = item.get("urls") or {}
+            animated_url = _best_scaled_url(animated_urls)
+            static_url = _best_scaled_url(static_urls)
+            url = animated_url or static_url
+
+            if not emote_id or not code or not url:
+                continue
+
+            emotes.append({
+                "kind": "emote",
+                "id": f"ffz:{emote_id}",
+                "source_id": emote_id,
+                "code": code,
+                "provider": "FFZ",
+                "third_party": True,
+                "animated": bool(animated_url),
+                "url": url,
+                "fallback_url": static_url or url
+            })
+
+    return emotes
+
+
+def _seventv_host_url(item):
+    data = item.get("data") if isinstance(item, dict) else None
+    data = data if isinstance(data, dict) else {}
+    host = data.get("host") if isinstance(data.get("host"), dict) else {}
+    base_url = _absolute_emote_url(host.get("url"))
+    files = host.get("files") if isinstance(host.get("files"), list) else []
+
+    preferred_names = (
+        "2x.webp", "3x.webp", "4x.webp", "1x.webp",
+        "2x.gif", "3x.gif", "1x.gif",
+        "2x.png", "3x.png", "1x.png"
+    )
+
+    selected = None
+    for name in preferred_names:
+        selected = next(
+            (file for file in files if file.get("name") == name),
+            None
+        )
+        if selected:
+            break
+
+    if selected and base_url:
+        return (
+            f"{base_url.rstrip('/')}/{selected['name']}",
+            int(selected.get("frame_count", 1) or 1) > 1
+        )
+
+    return "", False
+
+
+def _seventv_emotes(payload):
+    if not isinstance(payload, dict):
+        return []
+
+    items = payload.get("emotes")
+    if not isinstance(items, list):
+        emote_set = payload.get("emote_set")
+        if isinstance(emote_set, dict):
+            items = emote_set.get("emotes")
+    if not isinstance(items, list):
+        return []
+
+    emotes = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        emote_id = str(item.get("id") or data.get("id") or "")
+        code = str(item.get("name") or data.get("name") or "")
+        url, file_is_animated = _seventv_host_url(item)
+
+        if not url and emote_id:
+            url = f"https://cdn.7tv.app/emote/{emote_id}/2x.webp"
+
+        if not emote_id or not code or not url:
+            continue
+
+        emotes.append({
+            "kind": "emote",
+            "id": f"7tv:{emote_id}",
+            "source_id": emote_id,
+            "code": code,
+            "provider": "7TV",
+            "third_party": True,
+            "animated": bool(data.get("animated")) or file_is_animated,
+            "url": url,
+            "fallback_url": f"https://cdn.7tv.app/emote/{emote_id}/1x.webp"
+        })
+
+    return emotes
+
+
+def _load_third_party_provider(provider):
+    loaded_count = 0
+
+    try:
+        if provider == "BTTV":
+            global_response = requests.get(
+                "https://api.betterttv.net/3/cached/emotes/global",
+                timeout=7
+            )
+            global_response.raise_for_status()
+            global_emotes = _bttv_emotes(global_response.json())
+            _register_third_party_emotes(global_emotes)
+            loaded_count += len(global_emotes)
+
+            channel_response = requests.get(
+                "https://api.betterttv.net/3/cached/users/twitch/"
+                f"{BROADCASTER_ID}",
+                timeout=7
+            )
+            if channel_response.status_code == 200:
+                channel_payload = channel_response.json()
+                channel_items = (
+                    (channel_payload.get("channelEmotes") or [])
+                    + (channel_payload.get("sharedEmotes") or [])
+                )
+                channel_emotes = _bttv_emotes(channel_items)
+                _register_third_party_emotes(channel_emotes, channel=True)
+                loaded_count += len(channel_emotes)
+
+        elif provider == "FFZ":
+            global_response = requests.get(
+                "https://api.frankerfacez.com/v1/set/global",
+                timeout=7
+            )
+            global_response.raise_for_status()
+            global_emotes = _ffz_emotes(
+                global_response.json(),
+                global_sets=True
+            )
+            _register_third_party_emotes(global_emotes)
+            loaded_count += len(global_emotes)
+
+            channel_response = requests.get(
+                "https://api.frankerfacez.com/v1/room/id/"
+                f"{BROADCASTER_ID}",
+                timeout=7
+            )
+            if channel_response.status_code == 200:
+                channel_emotes = _ffz_emotes(channel_response.json())
+                _register_third_party_emotes(channel_emotes, channel=True)
+                loaded_count += len(channel_emotes)
+
+        elif provider == "7TV":
+            global_response = requests.get(
+                "https://7tv.io/v3/emote-sets/global",
+                timeout=7
+            )
+            global_response.raise_for_status()
+            global_emotes = _seventv_emotes(global_response.json())
+            _register_third_party_emotes(global_emotes)
+            loaded_count += len(global_emotes)
+
+            channel_response = requests.get(
+                f"https://7tv.io/v3/users/twitch/{BROADCASTER_ID}",
+                timeout=7
+            )
+            if channel_response.status_code == 200:
+                channel_emotes = _seventv_emotes(channel_response.json())
+                _register_third_party_emotes(channel_emotes, channel=True)
+                loaded_count += len(channel_emotes)
+
+        log(f"{provider}: {loaded_count} emotes carregados")
+
+    except Exception as e:
+        log(f"{provider}: emotes indisponíveis ({e})")
+
+
+def load_third_party_emotes():
+    global THIRD_PARTY_EMOTES_LOADING
+    global THIRD_PARTY_EMOTES_LOADED
+
+    with THIRD_PARTY_EMOTE_LOCK:
+        if THIRD_PARTY_EMOTES_LOADING or THIRD_PARTY_EMOTES_LOADED:
+            return
+        THIRD_PARTY_EMOTES_LOADING = True
+
+    workers = []
+    for provider in ("BTTV", "FFZ", "7TV"):
+        worker = threading.Thread(
+            target=_load_third_party_provider,
+            args=(provider,),
+            daemon=True
+        )
+        workers.append(worker)
+        worker.start()
+
+    for worker in workers:
+        worker.join()
+
+    with THIRD_PARTY_EMOTE_LOCK:
+        THIRD_PARTY_EMOTES_LOADING = False
+        THIRD_PARTY_EMOTES_LOADED = True
+
+    log("Emotes de terceiros prontos")
+
+
+def _third_party_parts(text):
+    """Substitui códigos exatos por emotes, preservando espaços e texto."""
+    if not text:
+        return []
+
+    parts = []
+    for chunk in re.findall(r"\S+|\s+", str(text)):
+        if chunk.isspace():
+            parts.append({"kind": "text", "text": chunk})
+            continue
+
+        with THIRD_PARTY_EMOTE_LOCK:
+            emote = (
+                THIRD_PARTY_EMOTE_CHANNEL.get(chunk)
+                or THIRD_PARTY_EMOTE_GLOBALS.get(chunk)
+            )
+
+        if emote:
+            parts.append(dict(emote))
+        else:
+            parts.append({"kind": "text", "text": chunk})
+
+    return parts
+
+
+def _download_emote(
+    cache_key,
+    animated=False,
+    url=None,
+    fallback_url=None,
+    source_id=None
+):
+    """Baixa e cacheia emotes da Twitch, BTTV, FFZ e 7TV."""
+    if not cache_key:
         return None
 
     with EMOTE_LOCK:
-        if emote_id in EMOTE_CACHE:
-            return EMOTE_CACHE[emote_id]
+        if cache_key in EMOTE_CACHE:
+            return EMOTE_CACHE[cache_key]
 
-    emote_format = "animated" if animated else "default"
-    url = (
-        "https://static-cdn.jtvnw.net/emoticons/v2/"
-        f"{emote_id}/{emote_format}/dark/3.0"
-    )
+    if not url:
+        twitch_id = source_id or cache_key
+        emote_format = "animated" if animated else "default"
+        url = (
+            "https://static-cdn.jtvnw.net/emoticons/v2/"
+            f"{twitch_id}/{emote_format}/dark/3.0"
+        )
+        if animated:
+            fallback_url = (
+                "https://static-cdn.jtvnw.net/emoticons/v2/"
+                f"{twitch_id}/default/dark/3.0"
+            )
 
     try:
         r = requests.get(url, timeout=5)
-        if animated and r.status_code != 200:
-            fallback_url = (
-                "https://static-cdn.jtvnw.net/emoticons/v2/"
-                f"{emote_id}/default/dark/3.0"
-            )
+        if r.status_code != 200 and fallback_url:
             r = requests.get(fallback_url, timeout=5)
         r.raise_for_status()
 
@@ -1533,17 +2009,30 @@ def _download_emote(emote_id, animated=False):
         }
 
         with EMOTE_LOCK:
-            EMOTE_CACHE[emote_id] = emote_data
+            EMOTE_CACHE[cache_key] = emote_data
 
         return emote_data
 
     except Exception as e:
-        log(f"Falha ao baixar emote {emote_id}: {e}")
+        log(f"Falha ao baixar emote {cache_key}: {e}")
         return None
 
 
-def _emote_photo(emote_id, frame_index=0, animated=False):
-    emote_data = _download_emote(emote_id, animated)
+def _emote_photo(
+    cache_key,
+    frame_index=0,
+    animated=False,
+    url=None,
+    fallback_url=None,
+    source_id=None
+):
+    emote_data = _download_emote(
+        cache_key,
+        animated,
+        url,
+        fallback_url,
+        source_id
+    )
 
     if emote_data is None:
         return None
@@ -1551,12 +2040,12 @@ def _emote_photo(emote_id, frame_index=0, animated=False):
     with EMOTE_LOCK:
         frames = emote_data["frames"]
         frame_index = frame_index % len(frames)
-        cache_key = (emote_id, frame_index)
-        photo = EMOTE_PHOTO_CACHE.get(cache_key)
+        photo_key = (cache_key, frame_index)
+        photo = EMOTE_PHOTO_CACHE.get(photo_key)
 
         if photo is None:
             photo = ImageTk.PhotoImage(frames[frame_index])
-            EMOTE_PHOTO_CACHE[cache_key] = photo
+            EMOTE_PHOTO_CACHE[photo_key] = photo
 
         return photo
 
@@ -1584,10 +2073,25 @@ def _message_tokens(message):
         kind = part.get("kind")
 
         if kind == "emote":
+            if part.get("third_party") and not THIRD_PARTY_EMOTES:
+                code = str(part.get("code") or "")
+                if code:
+                    tokens.append({
+                        "kind": "text",
+                        "text": code
+                    })
+                continue
+
             tokens.append({
                 "kind": "emote",
                 "id": str(part.get("id", "")),
-                "animated": bool(part.get("animated", False))
+                "source_id": str(part.get("source_id", "")),
+                "code": str(part.get("code", "")),
+                "provider": str(part.get("provider", "")),
+                "third_party": bool(part.get("third_party", False)),
+                "animated": bool(part.get("animated", False)),
+                "url": str(part.get("url", "")),
+                "fallback_url": str(part.get("fallback_url", ""))
             })
         else:
             text = part.get("text", "")
@@ -1677,7 +2181,10 @@ def _draw_token_row(tokens, y, line_height):
         if token["kind"] == "emote":
             photo = _emote_photo(
                 token["id"],
-                animated=token.get("animated", False)
+                animated=token.get("animated", False),
+                url=token.get("url") or None,
+                fallback_url=token.get("fallback_url") or None,
+                source_id=token.get("source_id") or None
             )
 
             if photo is not None:
@@ -1700,6 +2207,10 @@ def _draw_token_row(tokens, y, line_height):
                     ACTIVE_EMOTE_ANIMATIONS.append({
                         "item": image_item,
                         "id": token["id"],
+                        "source_id": token.get("source_id"),
+                        "url": token.get("url"),
+                        "fallback_url": token.get("fallback_url"),
+                        "animated": token.get("animated", False),
                         "frame": 0,
                         "next_at": time.monotonic()
                         + emote_data["durations"][0] / 1000.0
@@ -1708,8 +2219,8 @@ def _draw_token_row(tokens, y, line_height):
                 x -= w + EMOTE_GAP
                 continue
 
-            # Se o download falhar, mostra o ID como fallback.
-            fallback = f"[emote]"
+            # Se o download falhar, mantém o código visível no chat.
+            fallback = token.get("code") or "[emote]"
             width = chat_font.measure(fallback)
 
             canvas.create_text(
@@ -1813,7 +2324,14 @@ def animate_visible_emotes():
                 if now >= animation["next_at"]:
                     frame_count = len(emote_data["frames"])
                     animation["frame"] = (animation["frame"] + 1) % frame_count
-                    photo = _emote_photo(animation["id"], animation["frame"])
+                    photo = _emote_photo(
+                        animation["id"],
+                        animation["frame"],
+                        animated=animation.get("animated", False),
+                        url=animation.get("url") or None,
+                        fallback_url=animation.get("fallback_url") or None,
+                        source_id=animation.get("source_id") or None
+                    )
                     if photo is not None:
                         canvas.itemconfig(animation["item"], image=photo)
                     duration = emote_data["durations"][animation["frame"]]
@@ -1923,6 +2441,7 @@ dashboard_dragging = False
 
 
 dashboard = tk.Toplevel(root)
+dashboard.title("GoW Overlay - Live Control")
 # Oculta antes de iconbitmap/overrideredirect para impedir o flash 1x1 do Windows.
 dashboard.withdraw()
 try:
@@ -2879,6 +3398,7 @@ def open_support():
         return
 
     support_window = tk.Toplevel(root)
+    support_window.title("GoW Overlay - Suporte")
     support_window.withdraw()
     support_window.configure(bg="#161618")
     support_window.overrideredirect(True)
@@ -3109,11 +3629,544 @@ def quit_program():
     stop_tray_icon()
 
     try:
+        stop_remote_server()
+    except Exception:
+        pass
+
+    try:
         set_dp(False)
     except Exception:
         pass
 
     root.destroy()
+
+
+# =========================================================
+# CONTROLE REMOTO PELO CELULAR (QR CODE)
+# =========================================================
+# Servidor HTTP mínimo, só na rede local, protegido por um token aleatório
+# gerado a cada ativação. Fica desligado até o usuário ativar na janela
+# "Remoto". As ações são enfileiradas e executadas na thread da interface.
+
+REMOTE_PORT_PREFERRED = 8765
+REMOTE_SERVER = None
+REMOTE_TOKEN = None
+REMOTE_URL = ""
+REMOTE_ACTIONS = ("clear", "toggle_always", "toggle_dp")
+
+REMOTE_PAGE = """<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="referrer" content="no-referrer">
+<title>GoW Overlay</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;padding:20px;background:#121212;color:#f4f4f5;font:16px system-ui,sans-serif}
+h1{margin:0 0 4px;font-size:22px}
+.sub{color:#737377;font-size:13px;margin-bottom:18px}
+button{display:block;width:100%;margin:0 0 12px;padding:18px;border:1px solid #343438;
+border-radius:16px;background:#262629;color:#f4f4f5;font-size:17px;font-weight:600}
+button:active{background:#34343a}
+button.on{border-color:#2ea043}
+.card{background:#1b1b1d;border-radius:14px;padding:14px;margin-top:8px;font-size:14px;color:#b7b7bc}
+.row{display:flex;justify-content:space-between;padding:3px 0}
+.ok{color:#7ee787}.bad{color:#ff7b72}
+#msg{height:20px;margin-top:10px;font-size:13px;color:#9b9ba1;text-align:center}
+</style></head><body>
+<h1>GoW Overlay</h1><div class="sub">Controle remoto</div>
+<button id="clear">Limpar mensagens</button>
+<button id="toggle_always">Sempre mostrar mensagens</button>
+<button id="toggle_dp">Controle automático DP/OBS</button>
+<div class="card" id="status">Conectando...</div>
+<div id="msg"></div>
+<script>
+const T=new URLSearchParams(location.search).get('t')||'';
+const q='?t='+encodeURIComponent(T);
+const $=id=>document.getElementById(id);
+function dot(v){return '<span class="'+(v?'ok':'bad')+'">'+(v?'● ligado':'● desligado')+'</span>'}
+function row(a,b){return '<div class="row"><span>'+a+'</span><span>'+b+'</span></div>'}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+async function refresh(){
+  try{
+    const r=await fetch('/api/status'+q,{cache:'no-store'});
+    if(!r.ok)throw 0;
+    const s=await r.json();
+    $('toggle_always').classList.toggle('on',s.always);
+    $('toggle_dp').classList.toggle('on',s.control_dp);
+    $('status').innerHTML=
+      row('Twitch',dot(s.twitch))+row('OBS',dot(s.obs))+
+      row('Raids',dot(s.raids))+row('Resgates',dot(s.rewards))+
+      row('Última raid',esc(s.last_raid))+row('Último resgate',esc(s.last_reward));
+  }catch(e){$('status').textContent='Sem conexão com o PC';}
+}
+async function act(a){
+  try{
+    const r=await fetch('/api/'+a+q,{method:'POST'});
+    $('msg').textContent=r.ok?'Enviado':'Erro';
+  }catch(e){$('msg').textContent='Erro de conexão';}
+  setTimeout(()=>$('msg').textContent='',1500);
+  setTimeout(refresh,300);
+}
+['clear','toggle_always','toggle_dp'].forEach(a=>$(a).onclick=()=>act(a));
+refresh();setInterval(refresh,2500);
+</script></body></html>
+"""
+
+
+def get_lan_ip():
+    """Descobre o IP do PC na rede local (não envia nenhum dado)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("10.255.255.255", 1))
+        return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        sock.close()
+
+
+def remote_status_payload():
+    return {
+        "twitch": bool(state.get("twitch")),
+        "obs": bool(OBS_CONNECTED),
+        "raids": bool(state.get("raids")),
+        "rewards": bool(state.get("rewards")),
+        "always": bool(ALWAYS_SHOW_OVERLAY),
+        "control_dp": bool(CONTROL_DP),
+        "last_raid": str(state.get("last_raid", "-")),
+        "last_reward": str(state.get("last_reward", "-")),
+    }
+
+
+class RemoteHandler(BaseHTTPRequestHandler):
+    server_version = "GoWOverlay"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _authorized(self, query):
+        token = REMOTE_TOKEN
+        given = (query.get("t") or [""])[0]
+        return bool(token) and hmac.compare_digest(
+            given.encode("utf-8"), token.encode("utf-8")
+        )
+
+    def _send(self, code, body, content_type="text/html; charset=utf-8"):
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        query = parse_qs(url.query)
+
+        if not self._authorized(query):
+            self._send(403, "Acesso negado", "text/plain; charset=utf-8")
+        elif url.path == "/":
+            self._send(200, REMOTE_PAGE)
+        elif url.path == "/api/status":
+            self._send(
+                200,
+                json.dumps(remote_status_payload()),
+                "application/json"
+            )
+        else:
+            self._send(404, "Não encontrado", "text/plain; charset=utf-8")
+
+    def do_POST(self):
+        url = urlparse(self.path)
+        query = parse_qs(url.query)
+
+        if not self._authorized(query):
+            self._send(403, "Acesso negado", "text/plain; charset=utf-8")
+            return
+
+        action = url.path.removeprefix("/api/")
+        if action in REMOTE_ACTIONS:
+            queue_ui("remote", action)
+            self._send(200, '{"ok": true}', "application/json")
+        else:
+            self._send(404, "Não encontrado", "text/plain; charset=utf-8")
+
+
+def start_remote_server():
+    global REMOTE_SERVER, REMOTE_TOKEN, REMOTE_URL
+
+    if REMOTE_SERVER is not None:
+        return True
+
+    server = None
+    for port in (REMOTE_PORT_PREFERRED, 0):
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", port), RemoteHandler)
+            break
+        except OSError as error:
+            log(f"Controle remoto: porta {port or 'automática'} indisponível ({error})")
+
+    if server is None:
+        return False
+
+    server.daemon_threads = True
+    REMOTE_TOKEN = secrets.token_urlsafe(16)
+    REMOTE_URL = (
+        f"http://{get_lan_ip()}:{server.server_address[1]}/?t={REMOTE_TOKEN}"
+    )
+    REMOTE_SERVER = server
+
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log(f"Controle remoto ativado na porta {server.server_address[1]}")
+    return True
+
+
+def stop_remote_server():
+    global REMOTE_SERVER, REMOTE_TOKEN, REMOTE_URL
+
+    server = REMOTE_SERVER
+    if server is None:
+        return
+
+    REMOTE_SERVER = None
+    REMOTE_TOKEN = None
+    REMOTE_URL = ""
+
+    def _close():
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
+
+    threading.Thread(target=_close, daemon=True).start()
+    log("Controle remoto desativado")
+
+
+def handle_remote_action(action):
+    """Executa na thread da interface uma ação pedida pelo celular."""
+    global CONTROL_DP, last_active
+
+    if action == "clear":
+        clear_messages()
+
+    elif action == "toggle_always":
+        always_overlay_live_var.set(not bool(always_overlay_live_var.get()))
+        toggle_always_overlay_live()
+
+    elif action == "toggle_dp":
+        previous = CONTROL_DP
+        CONTROL_DP = not CONTROL_DP
+        last_active = None
+
+        if previous and not CONTROL_DP:
+            set_dp(False, force=True)
+
+        log(
+            "Controle automático do DP ligado"
+            if CONTROL_DP
+            else "Controle automático do DP desligado"
+        )
+        save_config()
+
+    log(f"Controle remoto: {action}")
+    refresh_dashboard()
+
+
+def make_rounded_note(parent, text, bg, fg, outline, width, font, bg_parent="#161618"):
+    """Caixa de aviso com bordas curvas, no mesmo estilo dos botões."""
+    pad = 12
+    canvas_obj = tk.Canvas(
+        parent,
+        width=width,
+        height=40,
+        bg=bg_parent,
+        highlightthickness=0,
+        bd=0
+    )
+    text_id = canvas_obj.create_text(
+        pad,
+        pad,
+        text=text,
+        fill=fg,
+        font=font,
+        anchor="nw",
+        width=width - pad * 2
+    )
+    bbox = canvas_obj.bbox(text_id)
+    height = (bbox[3] - bbox[1]) + pad * 2
+    canvas_obj.configure(height=height)
+    rounded_rect(
+        canvas_obj,
+        1, 1,
+        width - 1, height - 1,
+        radius=18,
+        fill=bg,
+        outline=outline
+    )
+    canvas_obj.tag_raise(text_id)
+    return canvas_obj
+
+
+remote_window = None
+remote_hwnd = None
+remote_widgets = {}
+
+
+def make_qr_photo(text, size=240):
+    if qrcode is None:
+        return None
+
+    try:
+        qr = qrcode.QRCode(
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=8,
+            border=2
+        )
+        qr.add_data(text)
+        qr.make(fit=True)
+        qr_image = qr.make_image(
+            fill_color="black",
+            back_color="white"
+        )
+        if hasattr(qr_image, "get_image"):
+            qr_image = qr_image.get_image()
+        image = qr_image.convert("RGB")
+        image = image.resize((size, size), Image.NEAREST)
+        return ImageTk.PhotoImage(image)
+    except Exception as error:
+        log(f"Erro ao gerar QR code: {error}")
+        return None
+
+
+def refresh_remote_window():
+    widgets = remote_widgets
+
+    try:
+        if remote_window is None or not remote_window.winfo_exists():
+            return
+    except Exception:
+        return
+
+    if REMOTE_SERVER is not None:
+        photo = make_qr_photo(REMOTE_URL)
+        widgets["status"].configure(
+            text="Ativo — escaneie com a câmera do celular",
+            fg="#7ee787"
+        )
+        widgets["url"].configure(text=REMOTE_URL)
+        widgets["toggle"].itemconfig(widgets["toggle_text"], text="Desativar")
+
+        if photo is not None:
+            widgets["qr"].configure(image=photo, text="")
+            widgets["qr"].image = photo
+        else:
+            widgets["qr"].configure(
+                image="",
+                text="QR indisponível.\nAbra o endereço abaixo no celular."
+            )
+            widgets["qr"].image = None
+    else:
+        widgets["status"].configure(text="Desativado", fg="#ff7b72")
+        widgets["url"].configure(text="-")
+        widgets["qr"].configure(image="", text="Desativado")
+        widgets["qr"].image = None
+        widgets["toggle"].itemconfig(widgets["toggle_text"], text="Ativar")
+
+
+def toggle_remote_server():
+    if REMOTE_SERVER is not None:
+        stop_remote_server()
+    else:
+        if not start_remote_server():
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "Não foi possível iniciar o controle remoto.\n\n"
+                "Confira o log para detalhes.",
+                "GoW Overlay",
+                0x10
+            )
+
+    refresh_remote_window()
+
+
+def hide_remote_window():
+    try:
+        remote_window.withdraw()
+    except Exception:
+        pass
+
+
+def open_remote():
+    global remote_window
+    global remote_hwnd
+
+    if remote_window is not None and remote_window.winfo_exists():
+        remote_window.deiconify()
+        remote_window.lift()
+        remote_window.focus_force()
+
+        try:
+            remote_hwnd, _ = protect_window_from_capture(remote_window)
+        except Exception:
+            pass
+
+        refresh_remote_window()
+        return
+
+    remote_window = tk.Toplevel(root)
+    remote_window.title("GoW Overlay - Remoto")
+    remote_window.withdraw()
+    remote_window.configure(bg="#161618")
+    remote_window.overrideredirect(True)
+    remote_window.attributes("-topmost", True)
+
+    remote_width = 440
+    remote_height = 640
+
+    remote_x = max(
+        0,
+        (remote_window.winfo_screenwidth() - remote_width) // 2 - 100
+    )
+    remote_y = max(
+        0,
+        (remote_window.winfo_screenheight() - remote_height) // 2
+    )
+    remote_window.geometry(
+        f"{remote_width}x{remote_height}+{remote_x}+{remote_y}"
+    )
+
+    titlebar = tk.Frame(remote_window, bg="#161618", height=58)
+    titlebar.pack(fill="x", padx=10, pady=(8, 4))
+    titlebar.pack_propagate(False)
+
+    tk.Label(
+        titlebar,
+        text="Controle remoto",
+        bg="#161618",
+        fg="#f5f5f7",
+        font=("Segoe UI", 18, "bold")
+    ).pack(anchor="center", pady=(3, 0))
+
+    tk.Label(
+        titlebar,
+        text="Celular na mesma rede Wi-Fi",
+        bg="#161618",
+        fg="#707075",
+        font=("Segoe UI", 9)
+    ).pack(anchor="center")
+
+    controls = tk.Frame(titlebar, bg="#161618")
+    controls.place(relx=1.0, x=-8, y=7, anchor="ne")
+
+    close_dot = tk.Label(
+        controls,
+        text="●",
+        bg="#161618",
+        fg="#ff5f57",
+        font=("Segoe UI Symbol", 13),
+        cursor="hand2"
+    )
+    close_dot.pack(side="left", padx=4)
+    close_dot.bind("<Button-1>", lambda e: hide_remote_window())
+
+    remote_widgets["status"] = tk.Label(
+        remote_window,
+        text="",
+        bg="#161618",
+        fg="#ff7b72",
+        font=("Segoe UI", 11, "bold")
+    )
+    remote_widgets["status"].pack(pady=(6, 8))
+
+    qr_holder = tk.Frame(remote_window, bg="#161618", width=250, height=250)
+    qr_holder.pack()
+    qr_holder.pack_propagate(False)
+    remote_widgets["qr"] = tk.Label(
+        qr_holder,
+        text="",
+        bg="#ffffff",
+        fg="#555555",
+        font=("Segoe UI", 10),
+        justify="center"
+    )
+    remote_widgets["qr"].pack(fill="both", expand=True, padx=5, pady=5)
+
+    remote_widgets["url"] = tk.Label(
+        remote_window,
+        text="-",
+        bg="#161618",
+        fg="#9b9ba1",
+        font=("Consolas", 8),
+        wraplength=400,
+        justify="center"
+    )
+    remote_widgets["url"].pack(padx=16, pady=(10, 8))
+
+    toggle_button = make_round_button(
+        remote_window,
+        "Ativar",
+        toggle_remote_server,
+        150
+    )
+    toggle_button.configure(bg="#161618")
+    toggle_button.pack(pady=(0, 12))
+    remote_widgets["toggle"] = toggle_button
+    remote_widgets["toggle_text"] = toggle_button.find_all()[-1]
+
+    make_rounded_note(
+        remote_window,
+        (
+            "O link contém um código secreto novo a cada ativação. "
+            "Não mostre este QR na live: esta janela fica fora da captura do OBS.\n\n"
+            "Funciona só na mesma rede Wi-Fi do PC e usa HTTP sem criptografia. "
+            "Evite redes públicas. Na primeira vez, permita o aplicativo no "
+            "Firewall do Windows (rede privada)."
+        ),
+        bg="#251b1b",
+        fg="#ffb4ae",
+        outline="#3a2626",
+        width=404,
+        font=("Segoe UI", 9)
+    ).pack(padx=18, pady=(0, 14))
+
+    remote_window.update_idletasks()
+
+    remote_hwnd, protected = protect_window_from_capture(remote_window)
+    apply_bubble_window_shape(remote_window, remote_hwnd)
+
+    if not protected:
+        log("AVISO: janela Remoto não pôde ser excluída da captura")
+
+    drag = {"x": 0, "y": 0}
+
+    def start_drag(event):
+        drag["x"] = event.x_root - remote_window.winfo_x()
+        drag["y"] = event.y_root - remote_window.winfo_y()
+
+    def move_drag(event):
+        remote_window.geometry(
+            f"+{event.x_root - drag['x']}+{event.y_root - drag['y']}"
+        )
+
+    titlebar.bind("<ButtonPress-1>", start_drag)
+    titlebar.bind("<B1-Motion>", move_drag)
+
+    refresh_remote_window()
+
+    remote_window.deiconify()
+    remote_window.lift()
+    remote_window.focus_force()
+
+    remote_window.after(
+        80,
+        lambda: protect_window_from_capture(remote_window)
+    )
 
 
 # grupo central
@@ -3132,43 +4185,50 @@ button_center.grid(
 for b in [
     make_round_button(
         button_center,
+        "Remoto",
+        open_remote,
+        95
+    ),
+
+    make_round_button(
+        button_center,
         "Configurações",
         lambda: open_settings(),
-        145
+        135
     ),
 
     make_round_button(
         button_center,
         "Limpar mensagens",
         clear_messages,
-        155
+        145
     ),
 
     make_round_button(
         button_center,
         "Suporte",
         open_support,
-        105
+        95
     ),
 
     make_round_button(
         button_center,
         "Sair",
         confirm_close_dashboard,
-        90
+        80
     ),
 
     make_round_button(
         button_center,
         "Ocultar",
         hide_dashboard,
-        105
+        95
     ),
 ]:
 
     b.pack(
         side="left",
-        padx=5
+        padx=4
     )
 
 
@@ -3769,6 +4829,9 @@ def process_ui_queue():
                 log_text.see("end")
                 log_text.configure(state="disabled")
 
+            elif kind == "remote":
+                handle_remote_action(value)
+
             elif kind == "tray_dashboard":
                 show_dashboard_from_tray()
 
@@ -3810,6 +4873,9 @@ def apply_settings(values, save=False, log_result=True):
     global CONTROL_DP
     global SHOW_CHAT
     global ANIMATE_EMOTES
+    global THIRD_PARTY_EMOTES
+    global LOG_TO_FILE
+    global SHOW_HINT
     global EMOTE_SIZE
     global CURRENT_SETTINGS_SCALE
     global F9_INITIAL_TIME
@@ -3824,6 +4890,8 @@ def apply_settings(values, save=False, log_result=True):
     try:
         previous_control_dp = CONTROL_DP
         previous_show_chat = SHOW_CHAT
+        previous_third_party_emotes = THIRD_PARTY_EMOTES
+        previous_log_to_file = LOG_TO_FILE
         previous_emote_size = EMOTE_SIZE
         MAX_MESSAGES = max(1, int(values["max_messages"].get()))
 
@@ -3854,6 +4922,9 @@ def apply_settings(values, save=False, log_result=True):
         CONTROL_DP = bool(values["control_dp"].get())
         SHOW_CHAT = bool(values["show_chat"].get())
         ANIMATE_EMOTES = bool(values["animate_emotes"].get())
+        THIRD_PARTY_EMOTES = bool(values["third_party_emotes"].get())
+        LOG_TO_FILE = bool(values["log_to_file"].get())
+        SHOW_HINT = bool(values["show_hint"].get())
         if CONTROL_DP != previous_control_dp:
             last_active = None
         AUTO_DELETE_SECONDS = max(
@@ -3873,6 +4944,27 @@ def apply_settings(values, save=False, log_result=True):
 
         if SHOW_CHAT != previous_show_chat:
             log("Exibição do chat ligada" if SHOW_CHAT else "Exibição do chat desligada")
+
+        if LOG_TO_FILE != previous_log_to_file:
+            if LOG_TO_FILE:
+                log("Log em arquivo ligado")
+            else:
+                # Registra antes de desligar de fato, para constar no arquivo.
+                LOG_TO_FILE = True
+                log("Log em arquivo desligado")
+                LOG_TO_FILE = False
+
+        if THIRD_PARTY_EMOTES != previous_third_party_emotes:
+            log(
+                "Emotes BTTV/FFZ/7TV ligados"
+                if THIRD_PARTY_EMOTES
+                else "Emotes BTTV/FFZ/7TV desligados"
+            )
+            if THIRD_PARTY_EMOTES and not THIRD_PARTY_EMOTES_LOADED:
+                threading.Thread(
+                    target=load_third_party_emotes,
+                    daemon=True
+                ).start()
 
         while len(messages) > MAX_MESSAGES:
             messages.pop(0)
@@ -3928,6 +5020,9 @@ def apply_settings(values, save=False, log_result=True):
             "control_dp": CONTROL_DP,
             "show_chat": SHOW_CHAT,
             "animate_emotes": ANIMATE_EMOTES,
+            "third_party_emotes": THIRD_PARTY_EMOTES,
+            "log_to_file": LOG_TO_FILE,
+            "show_hint": SHOW_HINT,
             "f9_initial_time": F9_INITIAL_TIME,
             "f9_repeat_time": F9_REPEAT_TIME,
             "always_show_overlay": ALWAYS_SHOW_OVERLAY,
@@ -4071,6 +5166,7 @@ def open_settings():
         return
 
     settings_window = tk.Toplevel(root)
+    settings_window.title("GoW Overlay - Configurações")
     settings_window.withdraw()
     settings_window.configure(bg="#161618")
 
@@ -4078,7 +5174,7 @@ def open_settings():
     settings_window.overrideredirect(True)
 
     settings_width = 620
-    settings_height = 980
+    settings_height = 1020
 
     settings_x = max(
         0,
@@ -5012,6 +6108,15 @@ def open_settings():
     animate_emotes_var = tk.BooleanVar(value=ANIMATE_EMOTES)
     values["animate_emotes"] = animate_emotes_var
 
+    third_party_emotes_var = tk.BooleanVar(value=THIRD_PARTY_EMOTES)
+    values["third_party_emotes"] = third_party_emotes_var
+
+    log_to_file_var = tk.BooleanVar(value=LOG_TO_FILE)
+    values["log_to_file"] = log_to_file_var
+
+    show_hint_var = tk.BooleanVar(value=SHOW_HINT)
+    values["show_hint"] = show_hint_var
+
     options_grid = tk.Frame(settings_window, bg="#161618")
     options_grid.grid(
         row=len(fields) + 3,
@@ -5062,7 +6167,7 @@ def open_settings():
         fg="#f4f4f5"
     )
     control_dp_option.grid(
-        row=1,
+        row=2,
         column=0,
         padx=(0, 10),
         pady=(2, 0),
@@ -5077,7 +6182,7 @@ def open_settings():
         fg="#f4f4f5"
     )
     animate_option.grid(
-        row=1,
+        row=2,
         column=1,
         padx=(10, 0),
         pady=(2, 0),
@@ -5092,11 +6197,55 @@ def open_settings():
         fg="#f4f4f5"
     )
     show_chat_option.grid(
-        row=2,
+        row=3,
         column=0,
-        columnspan=2,
         padx=(0, 10),
         pady=(10, 0),
+        sticky="w"
+    )
+
+    third_party_option = make_circle_check(
+        options_grid,
+        "Emotes BTTV, FFZ e 7TV",
+        third_party_emotes_var,
+        bg="#161618",
+        fg="#f4f4f5"
+    )
+    third_party_option.grid(
+        row=3,
+        column=1,
+        padx=(10, 0),
+        pady=(10, 0),
+        sticky="w"
+    )
+
+    log_to_file_option = make_circle_check(
+        options_grid,
+        "Salvar log em arquivo (AppData)",
+        log_to_file_var,
+        bg="#161618",
+        fg="#f4f4f5"
+    )
+    log_to_file_option.grid(
+        row=1,
+        column=0,
+        padx=(0, 10),
+        pady=(2, 8),
+        sticky="w"
+    )
+
+    show_hint_option = make_circle_check(
+        options_grid,
+        "Exibir dica de atalhos na tela",
+        show_hint_var,
+        bg="#161618",
+        fg="#f4f4f5"
+    )
+    show_hint_option.grid(
+        row=1,
+        column=1,
+        padx=(10, 0),
+        pady=(2, 8),
         sticky="w"
     )
 
@@ -5105,6 +6254,8 @@ def open_settings():
         always_option._set_enabled(enabled)
         auto_delete_option._set_enabled(enabled)
         animate_option._set_enabled(enabled)
+        third_party_option._set_enabled(enabled)
+        show_hint_option._set_enabled(enabled)
 
     show_chat_var.trace_add("write", update_chat_dependent_options)
     update_chat_dependent_options()
@@ -5168,6 +6319,11 @@ def open_settings():
         control_dp_var.set(bool(defaults.get("control_dp", True)))
         show_chat_var.set(bool(defaults.get("show_chat", True)))
         animate_emotes_var.set(bool(defaults.get("animate_emotes", True)))
+        third_party_emotes_var.set(
+            bool(defaults.get("third_party_emotes", True))
+        )
+        log_to_file_var.set(bool(defaults.get("log_to_file", True)))
+        show_hint_var.set(bool(defaults.get("show_hint", True)))
 
 
         # Não limpa messages.
@@ -5507,6 +6663,16 @@ def create_subscription(
             timeout=10
         )
 
+        if r.status_code == 401 and refresh_token():
+            # Token de acesso expirado (dura poucas horas): renova e repete.
+            log("Token da Twitch renovado")
+            r = requests.post(
+                "https://api.twitch.tv/helix/eventsub/subscriptions",
+                headers=twitch_headers(),
+                json=body,
+                timeout=10
+            )
+
         if r.status_code == 202:
             if status_key:
                 state[status_key] = True
@@ -5555,6 +6721,31 @@ def create_all_subscriptions(session_id):
         )
     else:
         log("Rewards sem scope channel:read:redemptions")
+
+    # Raid recebida não exige scope adicional. A condição "to" garante que o
+    # aviso seja somente para raids que chegam ao canal autorizado.
+    create_subscription(
+        session_id,
+        "channel.raid",
+        {
+            "to_broadcaster_user_id": BROADCASTER_ID
+        },
+        "raids"
+    )
+
+    if REQUIRED_BITS_SCOPE in TOKEN_SCOPES:
+        create_subscription(
+            session_id,
+            "channel.cheer",
+            {
+                "broadcaster_user_id": BROADCASTER_ID
+            },
+            "bits"
+        )
+    else:
+        state["bits"] = False
+        log("Bits sem scope bits:read")
+        queue_ui("status")
 
     if REQUIRED_SUB_SCOPE in TOKEN_SCOPES:
         ok1 = create_subscription(
@@ -5620,7 +6811,12 @@ def on_twitch_message(ws, raw_message):
                 ["id"]
             )
 
-            create_all_subscriptions(session_id)
+            if getattr(ws, "is_reconnect", False):
+                # Na reconexão pedida pela Twitch as assinaturas são
+                # transferidas sozinhas; recriá-las geraria erro 409.
+                log("Reconexão da Twitch concluída; assinaturas mantidas")
+            else:
+                create_all_subscriptions(session_id)
 
         elif message_type == "notification":
             event_type = (
@@ -5633,6 +6829,9 @@ def on_twitch_message(ws, raw_message):
                 data["payload"]
                 ["event"]
             )
+
+            if event_type != "channel.chat.message":
+                log(f"Notificação recebida: {event_type}")
 
             if event_type == "channel.chat.message":
                 username = event["chatter_user_name"]
@@ -5655,6 +6854,9 @@ def on_twitch_message(ws, raw_message):
                     }
                 ]
 
+                if not fragments:
+                    overlay_parts.extend(_third_party_parts(message_text))
+
                 for fragment in fragments:
                     fragment_type = fragment.get("type")
 
@@ -5670,20 +6872,22 @@ def on_twitch_message(ws, raw_message):
                                 "animated": "animated" in emote_formats
                             })
                         else:
-                            overlay_parts.append({
-                                "kind": "text",
-                                "text": fragment.get("text", "")
-                            })
+                            overlay_parts.extend(
+                                _third_party_parts(fragment.get("text", ""))
+                            )
                     else:
-                        overlay_parts.append({
-                            "kind": "text",
-                            "text": fragment.get("text", "")
-                        })
+                        overlay_parts.extend(
+                            _third_party_parts(fragment.get("text", ""))
+                        )
 
-                add_overlay_message({
-                    "parts": overlay_parts,
-                    "text": display
-                })
+                # Quando é um Cheer, channel.cheer cria um aviso próprio com a
+                # quantidade de Bits. Evita mostrar a mesma mensagem duas vezes.
+                is_cheer_message = bool(event.get("cheer"))
+                if not (is_cheer_message and state["bits"]):
+                    add_overlay_message({
+                        "parts": overlay_parts,
+                        "text": display
+                    })
 
                 log(f"CHAT: {display}")
                 queue_ui("status")
@@ -5723,6 +6927,57 @@ def on_twitch_message(ws, raw_message):
                 add_overlay_message(overlay_display)
 
                 log(f"RESGATE: {display}")
+                queue_ui("status")
+
+            elif event_type == "channel.raid":
+                username = event.get(
+                    "from_broadcaster_user_name",
+                    "Canal desconhecido"
+                )
+
+                try:
+                    viewers = int(event.get("viewers", 0) or 0)
+                except (TypeError, ValueError):
+                    viewers = 0
+
+                viewer_word = (
+                    "espectador" if viewers == 1 else "espectadores"
+                )
+                display = (
+                    f"{username} chegou com {viewers} {viewer_word}"
+                )
+
+                state["last_raid"] = display
+                state["raid_count"] += 1
+
+                add_overlay_message(f"RAID • {display}")
+
+                log(f"RAID: {display}")
+                queue_ui("status")
+
+            elif event_type == "channel.cheer":
+                username = event.get("user_name")
+                if event.get("is_anonymous") or not username:
+                    username = "Anônimo"
+
+                try:
+                    bits = int(event.get("bits", 0) or 0)
+                except (TypeError, ValueError):
+                    bits = 0
+
+                bit_word = "Bit" if bits == 1 else "Bits"
+                message = str(event.get("message") or "").strip()
+                display = f"{username} enviou {bits} {bit_word}"
+
+                if message:
+                    display = f"{display} — {message}"
+
+                state["last_bits"] = display
+                state["bits_count"] += bits
+
+                add_overlay_message(f"BITS • {display}")
+
+                log(f"BITS: {display}")
                 queue_ui("status")
 
             elif event_type == "channel.subscribe":
@@ -5804,8 +7059,8 @@ def on_twitch_message(ws, raw_message):
             log("Twitch solicitou reconexão")
 
             threading.Thread(
-                target=start_twitch,
-                args=(reconnect_url,),
+                target=twitch_loop,
+                args=(reconnect_url, True),
                 daemon=True
             ).start()
 
@@ -5814,40 +7069,88 @@ def on_twitch_message(ws, raw_message):
 
 
 def on_twitch_error(ws, error):
+    if ws is not TWITCH_WS:
+        return
+
     state["twitch"] = False
     state["chat"] = False
     state["rewards"] = False
     state["subs"] = False
+    state["raids"] = False
+    state["bits"] = False
 
     queue_ui("status")
     log(f"Erro WebSocket Twitch: {error}")
 
 
 def on_twitch_close(ws, code, reason):
+    if ws is not TWITCH_WS:
+        # Socket antigo encerrado após a troca de sessão: é esperado.
+        return
+
     state["twitch"] = False
     state["chat"] = False
     state["rewards"] = False
     state["subs"] = False
+    state["raids"] = False
+    state["bits"] = False
 
     queue_ui("status")
     log(f"Twitch desconectou: {code} {reason}")
 
 
-def start_twitch(
-    url="wss://eventsub.wss.twitch.tv/ws"
-):
+TWITCH_WS = None
+TWITCH_EVENTSUB_URL = "wss://eventsub.wss.twitch.tv/ws"
+TWITCH_RETRY_SECONDS = 5
+
+
+def start_twitch(url=TWITCH_EVENTSUB_URL, is_reconnect=False):
+    global TWITCH_WS
+
     ws = websocket.WebSocketApp(
         url,
         on_message=on_twitch_message,
         on_error=on_twitch_error,
         on_close=on_twitch_close
     )
+    ws.is_reconnect = is_reconnect
+    TWITCH_WS = ws
 
     ws.run_forever()
+    return ws
+
+
+def twitch_loop(url=TWITCH_EVENTSUB_URL, is_reconnect=False):
+    """Mantém o EventSub conectado, reconectando se a conexão cair."""
+    while True:
+        try:
+            ws = start_twitch(url, is_reconnect)
+        except Exception as e:
+            log(f"Erro ao conectar na Twitch: {e}")
+            ws = TWITCH_WS
+
+        if ws is not TWITCH_WS:
+            # Outra conexão assumiu (troca de sessão pedida pela Twitch).
+            return
+
+        log(
+            f"Conexão com a Twitch caiu; "
+            f"tentando de novo em {TWITCH_RETRY_SECONDS}s"
+        )
+        time.sleep(TWITCH_RETRY_SECONDS)
+        url = TWITCH_EVENTSUB_URL
+        is_reconnect = False
+
+
+if THIRD_PARTY_EMOTES:
+    threading.Thread(
+        target=load_third_party_emotes,
+        daemon=True
+    ).start()
 
 
 threading.Thread(
-    target=start_twitch,
+    target=twitch_loop,
     daemon=True
 ).start()
 
@@ -5856,6 +7159,91 @@ threading.Thread(
 # =========================================================
 # VISIBILIDADE / FOCO
 # =========================================================
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+MAX_WINDOWS_PROCESS_PATH = 32768
+
+
+def window_executable_name(hwnd):
+    """Retorna o nome do executável responsável por uma janela do Windows."""
+    if not hwnd:
+        return ""
+
+    process_id = wintypes.DWORD()
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    try:
+        get_window_process_id = user32.GetWindowThreadProcessId
+        get_window_process_id.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD)
+        ]
+        get_window_process_id.restype = wintypes.DWORD
+
+        if not get_window_process_id(hwnd, ctypes.byref(process_id)):
+            return ""
+
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD
+        ]
+        open_process.restype = wintypes.HANDLE
+
+        query_process_path = kernel32.QueryFullProcessImageNameW
+        query_process_path.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD)
+        ]
+        query_process_path.restype = wintypes.BOOL
+
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        process_handle = open_process(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            False,
+            process_id.value
+        )
+
+        if not process_handle:
+            return ""
+
+        try:
+            path_buffer = ctypes.create_unicode_buffer(
+                MAX_WINDOWS_PROCESS_PATH
+            )
+            path_length = wintypes.DWORD(len(path_buffer))
+
+            if not query_process_path(
+                process_handle,
+                0,
+                path_buffer,
+                ctypes.byref(path_length)
+            ):
+                return ""
+
+            return os.path.basename(path_buffer.value)
+
+        finally:
+            close_handle(process_handle)
+
+    except Exception:
+        return ""
+
+
+def is_gow_window(hwnd):
+    """Aceita somente janelas pertencentes ao executável real do jogo."""
+    return (
+        window_executable_name(hwnd).casefold()
+        == GAME_EXE.casefold()
+    )
+
 
 def capture_gow_return_window():
     global gow_return_hwnd
@@ -5866,9 +7254,7 @@ def capture_gow_return_window():
         if not hwnd:
             return False
 
-        title = win32gui.GetWindowText(hwnd)
-
-        if "God of War" in title:
+        if is_gow_window(hwnd):
             gow_return_hwnd = hwnd
             return True
 
@@ -5992,9 +7378,7 @@ def is_gow_foreground():
         if not hwnd:
             return False
 
-        title = win32gui.GetWindowText(hwnd)
-
-        return "God of War" in title
+        return is_gow_window(hwnd)
 
     except Exception:
         return False
@@ -6036,7 +7420,10 @@ def apply_overlay_visibility():
     try:
         if show_messages:
             root.deiconify()
-            hint_root.deiconify()
+            if SHOW_HINT:
+                hint_root.deiconify()
+            else:
+                hint_root.withdraw()
         else:
             root.withdraw()
             hint_root.withdraw()
@@ -6267,6 +7654,11 @@ if REQUIRED_SUB_SCOPE not in TOKEN_SCOPES:
     log(
         "ATENÇÃO: para mostrar subs, autorize "
         "channel:read:subscriptions"
+    )
+
+if REQUIRED_BITS_SCOPE not in TOKEN_SCOPES:
+    log(
+        "ATENÇÃO: para mostrar Cheers/Bits, autorize bits:read"
     )
 
 process_overlay_queue()
