@@ -12,6 +12,7 @@ import io
 import re
 import socket
 import hmac
+import math
 import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -340,7 +341,10 @@ DEFAULT_CONFIG = {
     "always_show_overlay": False,
     "auto_delete_messages": False,
     "auto_delete_seconds": 30,
-    "show_startup_info": True
+    "show_startup_info": True,
+    "remote_port": 8765,
+    "remote_token": "",
+    "always_on_top": True
 }
 
 
@@ -450,6 +454,24 @@ ALWAYS_SHOW_OVERLAY = bool(config.get("always_show_overlay", False))
 AUTO_DELETE_MESSAGES = bool(config.get("auto_delete_messages", False))
 AUTO_DELETE_SECONDS = max(1, int(config.get("auto_delete_seconds", 30)))
 SHOW_STARTUP_INFO = bool(config.get("show_startup_info", True))
+# Mantém as janelas do app (Live Control, Configurações, Suporte e Remoto)
+# sempre por cima das outras. O overlay do chat não é afetado.
+ALWAYS_ON_TOP = bool(config.get("always_on_top", True))
+
+# Porta preferida do controle remoto (celular). Se estiver ocupada por outro
+# programa, o aplicativo usa outra porta livre automaticamente.
+try:
+    REMOTE_PORT_PREFERRED = int(config.get("remote_port", 8765))
+    if not 1024 <= REMOTE_PORT_PREFERRED <= 65535:
+        raise ValueError
+except (TypeError, ValueError):
+    REMOTE_PORT_PREFERRED = 8765
+
+# Código secreto do link do celular. Fica salvo para o link/QR não mudar a
+# cada ativação. "Novo link" na janela Remoto gera outro.
+REMOTE_TOKEN_SAVED = str(config.get("remote_token", "") or "")
+if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", REMOTE_TOKEN_SAVED):
+    REMOTE_TOKEN_SAVED = ""
 
 
 def save_config():
@@ -481,7 +503,10 @@ def save_config():
         "always_show_overlay": ALWAYS_SHOW_OVERLAY,
         "auto_delete_messages": AUTO_DELETE_MESSAGES,
         "auto_delete_seconds": AUTO_DELETE_SECONDS,
-        "show_startup_info": SHOW_STARTUP_INFO
+        "show_startup_info": SHOW_STARTUP_INFO,
+        "remote_port": REMOTE_PORT_PREFERRED,
+        "remote_token": REMOTE_TOKEN_SAVED,
+        "always_on_top": ALWAYS_ON_TOP
     }
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -2449,7 +2474,7 @@ try:
 except Exception:
     pass
 dashboard.overrideredirect(True)
-dashboard.attributes("-topmost", True)
+dashboard.attributes("-topmost", ALWAYS_ON_TOP)
 dashboard.configure(bg="#121212")
 dashboard_width = 760
 dashboard_height = 720
@@ -3402,7 +3427,7 @@ def open_support():
     support_window.withdraw()
     support_window.configure(bg="#161618")
     support_window.overrideredirect(True)
-    support_window.attributes("-topmost", True)
+    support_window.attributes("-topmost", ALWAYS_ON_TOP)
 
     support_width = 720
     support_height = 560
@@ -3648,11 +3673,51 @@ def quit_program():
 # gerado a cada ativação. Fica desligado até o usuário ativar na janela
 # "Remoto". As ações são enfileiradas e executadas na thread da interface.
 
-REMOTE_PORT_PREFERRED = 8765
 REMOTE_SERVER = None
+REMOTE_THREAD = None
 REMOTE_TOKEN = None
 REMOTE_URL = ""
+REMOTE_IP = ""
+REMOTE_PORT = 0
+REMOTE_PORT_BUSY = None       # porta preferida que estava ocupada (se houve troca)
+REMOTE_LAST_SEEN = None       # último contato autorizado do celular
+REMOTE_LOST_REASON = ""       # motivo da perda de conexão ("" = tudo certo)
+REMOTE_HEALTH_JOB = None
+REMOTE_CONTACT_TIMEOUT = 8    # segundos sem contato até avisar "sem contato"
+REMOTE_FONTS = []
+REMOTE_MONITORS = []
 REMOTE_ACTIONS = ("clear", "toggle_always", "toggle_dp")
+
+# Campos numéricos da janela de Configurações:
+# chave, rótulo, inteiro?, mínimo aceito, máximo aceito
+REMOTE_NUMBER_FIELDS = (
+    ("max_messages", "Máximo de mensagens", True, 1, 100),
+    ("text_opacity", "Opacidade", False, 0.05, 1.0),
+    ("font_size", "Tamanho da fonte", True, 1, 200),
+    ("outline_size", "Borda preta", True, 0, 50),
+    ("message_gap", "Espaço entre mensagens", True, -100, 500),
+    ("text_width", "Largura do texto", True, 50, 4000),
+    ("overlay_width", "Largura do overlay", True, 100, 8000),
+    ("overlay_height", "Altura do overlay", True, 100, 8000),
+    ("position_x_offset", "Posição X", True, -8000, 8000),
+    ("position_y_offset", "Posição Y", True, -8000, 8000),
+    ("f9_initial_time", "F9 - primeira remoção", False, 0.1, 60),
+    ("f9_repeat_time", "F9 - próximas remoções", False, 0.1, 60),
+    ("auto_delete_seconds", "Tempo para apagar (segundos)", True, 1, 600),
+)
+
+# Opções liga/desliga da janela de Configurações
+REMOTE_BOOL_FIELDS = (
+    ("always_show_overlay", "Sempre mostrar mensagens"),
+    ("auto_delete_messages", "Apagar mensagens automaticamente"),
+    ("control_dp", "Controle automático DP/OBS"),
+    ("animate_emotes", "Animar emotes"),
+    ("show_chat", "Exibir chat no overlay"),
+    ("third_party_emotes", "Emotes BTTV, FFZ e 7TV"),
+    ("log_to_file", "Salvar log em arquivo (AppData)"),
+    ("show_hint", "Exibir dica de atalhos na tela"),
+    ("always_on_top", "Janelas do app sempre por cima"),
+)
 
 REMOTE_PAGE = """<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
@@ -3664,28 +3729,106 @@ REMOTE_PAGE = """<!doctype html>
 body{margin:0;padding:20px;background:#121212;color:#f4f4f5;font:16px system-ui,sans-serif}
 h1{margin:0 0 4px;font-size:22px}
 .sub{color:#737377;font-size:13px;margin-bottom:18px}
-button{display:block;width:100%;margin:0 0 12px;padding:18px;border:1px solid #343438;
-border-radius:16px;background:#262629;color:#f4f4f5;font-size:17px;font-weight:600}
+button,summary{display:block;width:100%;margin:0 0 12px;padding:18px;border:1px solid #343438;
+border-radius:16px;background:#262629;color:#f4f4f5;font-size:17px;font-weight:600;text-align:left;list-style:none}
+button{text-align:center}
+summary::-webkit-details-marker{display:none}
+summary::after{content:'\\25BE';float:right;color:#737377}
+details[open]>summary::after{content:'\\25B4'}
 button:active{background:#34343a}
 button.on{border-color:#2ea043}
+button.apply{background:#1f6f34;border-color:#2ea043}
+button.ghost{background:transparent;color:#9b9ba1;padding:12px;font-size:14px}
 .card{background:#1b1b1d;border-radius:14px;padding:14px;margin-top:8px;font-size:14px;color:#b7b7bc}
 .row{display:flex;justify-content:space-between;padding:3px 0}
 .ok{color:#7ee787}.bad{color:#ff7b72}
-#msg{height:20px;margin-top:10px;font-size:13px;color:#9b9ba1;text-align:center}
+#msg,#cmsg{height:20px;margin-top:10px;font-size:13px;color:#9b9ba1;text-align:center}
+#cmsg{height:auto;min-height:20px}
+.fld{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;
+border-bottom:1px solid #262629;font-size:14px;color:#d4d4d8}
+.fld span{flex:1}
+.fld input[type=number],.fld select{width:46%;max-width:210px;padding:10px;border:1px solid #343438;
+border-radius:10px;background:#262629;color:#f4f4f5;font-size:15px;text-align:center}
+.fld select{text-align:left}
+.sw input{appearance:none;-webkit-appearance:none;width:50px;height:30px;border-radius:15px;
+background:#3a3a3f;position:relative;flex:none;outline:none}
+.sw input::after{content:'';position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;
+background:#f4f4f5;transition:left .15s}
+.sw input:checked{background:#2ea043}
+.sw input:checked::after{left:23px}
 </style></head><body>
 <h1>GoW Overlay</h1><div class="sub">Controle remoto</div>
 <button id="clear">Limpar mensagens</button>
 <button id="toggle_always">Sempre mostrar mensagens</button>
 <button id="toggle_dp">Controle automático DP/OBS</button>
+<details id="cfg"><summary>Configurações</summary>
+<div class="card" id="form">Carregando...</div>
+<div id="cmsg"></div>
+<button class="apply" id="apply" style="margin-top:12px">Aplicar e salvar</button>
+<button class="ghost" id="discard">Descartar alterações</button>
+</details>
 <div class="card" id="status">Conectando...</div>
 <div id="msg"></div>
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';
 const q='?t='+encodeURIComponent(T);
 const $=id=>document.getElementById(id);
+let dirty=false,built=false,meta=null;
 function dot(v){return '<span class="'+(v?'ok':'bad')+'">'+(v?'● ligado':'● desligado')+'</span>'}
 function row(a,b){return '<div class="row"><span>'+a+'</span><span>'+b+'</span></div>'}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function el(tag,props,kids){const e=document.createElement(tag);Object.assign(e,props||{});(kids||[]).forEach(k=>e.append(k));return e}
+function mark(){dirty=true}
+function field(label,ctrl,cls){return el('label',{className:'fld'+(cls?' '+cls:'')},[el('span',{textContent:label}),ctrl])}
+function buildForm(){
+  const box=$('form');box.textContent='';
+  const fs=el('select',{id:'f_font',onchange:mark});
+  meta.fonts.forEach(f=>fs.append(new Option(f,f)));
+  box.append(field('Fonte',fs));
+  const ms=el('select',{id:'f_overlay_monitor',onchange:mark});
+  meta.monitors.forEach((m,i)=>ms.append(new Option(m,String(i+1))));
+  box.append(field('Monitor do chat',ms));
+  meta.numbers.forEach(n=>box.append(field(n.label,el('input',{
+    id:'f_'+n.key,type:'number',step:n.int?'1':'any',inputMode:n.int?'numeric':'decimal',oninput:mark}))));
+  meta.bools.forEach(b=>box.append(field(b.label,el('input',{id:'f_'+b.key,type:'checkbox',onchange:mark}),'sw')));
+  built=true;
+}
+function fillForm(){
+  const v=meta.values;
+  $('f_font').value=v.font;
+  $('f_overlay_monitor').value=String(v.overlay_monitor);
+  meta.numbers.forEach(n=>{$('f_'+n.key).value=v[n.key]});
+  meta.bools.forEach(b=>{$('f_'+b.key).checked=!!v[b.key]});
+}
+async function loadSettings(force){
+  if(dirty&&!force)return;
+  try{
+    const r=await fetch('/api/settings'+q,{cache:'no-store'});
+    if(!r.ok)throw 0;
+    meta=await r.json();
+    if(!built)buildForm();
+    fillForm();
+    dirty=false;
+  }catch(e){$('cmsg').textContent='Não foi possível carregar as configurações'}
+}
+async function applySettings(){
+  if(!built)return;
+  const body={font:$('f_font').value,overlay_monitor:parseInt($('f_overlay_monitor').value,10)};
+  for(const n of meta.numbers){
+    const raw=$('f_'+n.key).value;
+    const num=parseFloat(raw);
+    if(raw===''||isNaN(num)){$('cmsg').textContent='Preencha: '+n.label;return}
+    body[n.key]=num;
+  }
+  meta.bools.forEach(b=>{body[b.key]=$('f_'+b.key).checked});
+  try{
+    const r=await fetch('/api/settings'+q,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json().catch(()=>({}));
+    $('cmsg').textContent=r.ok?'Configurações aplicadas e salvas':(j.error||'Erro ao aplicar');
+    if(r.ok){dirty=false;setTimeout(()=>loadSettings(true),600)}
+  }catch(e){$('cmsg').textContent='Erro de conexão'}
+  setTimeout(()=>{$('cmsg').textContent=''},3500);
+}
 async function refresh(){
   try{
     const r=await fetch('/api/status'+q,{cache:'no-store'});
@@ -3697,7 +3840,8 @@ async function refresh(){
       row('Twitch',dot(s.twitch))+row('OBS',dot(s.obs))+
       row('Raids',dot(s.raids))+row('Resgates',dot(s.rewards))+
       row('Última raid',esc(s.last_raid))+row('Último resgate',esc(s.last_reward));
-  }catch(e){$('status').textContent='Sem conexão com o PC';}
+    if($('cfg').open)loadSettings(false);
+  }catch(e){$('status').textContent='Sem conexão com o PC — tentando reconectar...';}
 }
 async function act(a){
   try{
@@ -3706,8 +3850,12 @@ async function act(a){
   }catch(e){$('msg').textContent='Erro de conexão';}
   setTimeout(()=>$('msg').textContent='',1500);
   setTimeout(refresh,300);
+  if(a!=='clear')setTimeout(()=>{if($('cfg').open)loadSettings(false)},500);
 }
 ['clear','toggle_always','toggle_dp'].forEach(a=>$(a).onclick=()=>act(a));
+$('apply').onclick=applySettings;
+$('discard').onclick=()=>loadSettings(true);
+$('cfg').addEventListener('toggle',()=>{if($('cfg').open)loadSettings(true)});
 refresh();setInterval(refresh,2500);
 </script></body></html>
 """
@@ -3738,6 +3886,166 @@ def remote_status_payload():
     }
 
 
+def remote_settings_snapshot():
+    """Valores atuais de TODAS as opções da janela de Configurações."""
+    return {
+        "font": FONT_NAME,
+        "overlay_monitor": OVERLAY_MONITOR,
+        "max_messages": MAX_MESSAGES,
+        "text_opacity": round(TEXT_OPACITY, 2),
+        "font_size": FONT_SIZE,
+        "outline_size": OUTLINE_SIZE,
+        "message_gap": MESSAGE_GAP,
+        "text_width": TEXT_WIDTH,
+        "overlay_width": OVERLAY_WIDTH,
+        "overlay_height": OVERLAY_HEIGHT,
+        "position_x_offset": POSITION_X_OFFSET,
+        "position_y_offset": POSITION_Y_OFFSET,
+        "f9_initial_time": F9_INITIAL_TIME,
+        "f9_repeat_time": F9_REPEAT_TIME,
+        "auto_delete_seconds": AUTO_DELETE_SECONDS,
+        "always_show_overlay": bool(ALWAYS_SHOW_OVERLAY),
+        "auto_delete_messages": bool(AUTO_DELETE_MESSAGES),
+        "control_dp": bool(CONTROL_DP),
+        "animate_emotes": bool(ANIMATE_EMOTES),
+        "show_chat": bool(SHOW_CHAT),
+        "third_party_emotes": bool(THIRD_PARTY_EMOTES),
+        "log_to_file": bool(LOG_TO_FILE),
+        "show_hint": bool(SHOW_HINT),
+        "always_on_top": bool(ALWAYS_ON_TOP),
+    }
+
+
+def remote_settings_payload():
+    return {
+        "values": remote_settings_snapshot(),
+        "fonts": list(REMOTE_FONTS),
+        "monitors": list(REMOTE_MONITORS),
+        "numbers": [
+            {"key": key, "label": label, "int": is_int}
+            for key, label, is_int, _lo, _hi in REMOTE_NUMBER_FIELDS
+        ],
+        "bools": [
+            {"key": key, "label": label}
+            for key, label in REMOTE_BOOL_FIELDS
+        ],
+    }
+
+
+def refresh_remote_choices():
+    """Lista fontes e monitores. Roda na thread da interface (usa o Tk)."""
+    global REMOTE_FONTS, REMOTE_MONITORS
+
+    try:
+        fonts = sorted(set(tkfont.families()), key=str.lower)
+    except Exception:
+        fonts = []
+    if FONT_NAME not in fonts:
+        fonts.insert(0, FONT_NAME)
+    REMOTE_FONTS = fonts
+
+    monitors = []
+    try:
+        for index, (left, top, right, bottom) in enumerate(
+            get_monitor_rects(), start=1
+        ):
+            monitors.append(f"Monitor {index} — {right - left}×{bottom - top}")
+    except Exception:
+        pass
+    REMOTE_MONITORS = monitors or ["Monitor 1"]
+
+
+def parse_remote_settings(data):
+    """Valida o que veio do celular. Retorna (valores, erro)."""
+    if not isinstance(data, dict):
+        return None, "Dados inválidos"
+
+    clean = {}
+
+    for key, label, is_int, low, high in REMOTE_NUMBER_FIELDS:
+        if key not in data:
+            continue
+        raw = data[key]
+        if isinstance(raw, bool):
+            return None, f"Valor inválido em {label}"
+        try:
+            number = float(str(raw).replace(",", "."))
+        except (TypeError, ValueError):
+            return None, f"Valor inválido em {label}"
+        if not math.isfinite(number):
+            return None, f"Valor inválido em {label}"
+        if not low <= number <= high:
+            return None, f"{label}: use um valor entre {low} e {high}"
+        clean[key] = int(round(number)) if is_int else number
+
+    for key, label in REMOTE_BOOL_FIELDS:
+        if key in data:
+            if not isinstance(data[key], bool):
+                return None, f"Valor inválido em {label}"
+            clean[key] = data[key]
+
+    if "font" in data:
+        font = data["font"]
+        if not isinstance(font, str) or font not in REMOTE_FONTS:
+            return None, "Fonte não encontrada neste PC"
+        clean["font"] = font
+
+    if "overlay_monitor" in data:
+        try:
+            monitor = int(data["overlay_monitor"])
+        except (TypeError, ValueError):
+            return None, "Monitor inválido"
+        if not 1 <= monitor <= max(1, len(REMOTE_MONITORS)):
+            return None, "Monitor inválido"
+        clean["overlay_monitor"] = monitor
+
+    return clean, None
+
+
+class _RemoteValue:
+    """Imita a interface .get() das variáveis do Tk usada por apply_settings."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def get(self):
+        return self._value
+
+
+def apply_remote_settings(changes):
+    """Executa na thread da interface: aplica e salva as opções do celular."""
+    snapshot = remote_settings_snapshot()
+    merged = dict(snapshot)
+    merged.update(changes)
+
+    # Trocar de monitor reescala os tamanhos, igual à janela de Configurações.
+    # Valores que o usuário mexeu no celular são respeitados como digitados.
+    new_monitor = int(merged["overlay_monitor"])
+    if new_monitor != OVERLAY_MONITOR:
+        old_scale = CURRENT_SETTINGS_SCALE or 1.0
+        ratio = monitor_scale(new_monitor) / old_scale
+        for key in SCALABLE_SETTING_KEYS:
+            if key not in changes or changes[key] == snapshot[key]:
+                merged[key] = int(round(float(snapshot[key]) * ratio))
+
+    apply_settings(
+        {key: _RemoteValue(value) for key, value in merged.items()},
+        save=True,
+        log_result=False
+    )
+    log("Controle remoto: configurações alteradas pelo celular")
+
+
+class RemoteServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    # O HTTPServer padrão liga SO_REUSEADDR. No Windows isso deixa DOIS
+    # programas escutarem a mesma porta sem erro, e o celular pode acabar
+    # falando com o outro script. Desligado, a porta ocupada gera erro e o
+    # aplicativo troca para uma porta livre.
+    allow_reuse_address = False
+
+
 class RemoteHandler(BaseHTTPRequestHandler):
     server_version = "GoWOverlay"
     protocol_version = "HTTP/1.1"
@@ -3746,11 +4054,16 @@ class RemoteHandler(BaseHTTPRequestHandler):
         pass
 
     def _authorized(self, query):
+        global REMOTE_LAST_SEEN
+
         token = REMOTE_TOKEN
         given = (query.get("t") or [""])[0]
-        return bool(token) and hmac.compare_digest(
+        ok = bool(token) and hmac.compare_digest(
             given.encode("utf-8"), token.encode("utf-8")
         )
+        if ok:
+            REMOTE_LAST_SEEN = time.time()
+        return ok
 
     def _send(self, code, body, content_type="text/html; charset=utf-8"):
         data = body.encode("utf-8") if isinstance(body, str) else body
@@ -3763,6 +4076,18 @@ class RemoteHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
+
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length <= 0 or length > 16384:
+            return None
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, OSError):
+            return None
 
     def do_GET(self):
         url = urlparse(self.path)
@@ -3778,6 +4103,12 @@ class RemoteHandler(BaseHTTPRequestHandler):
                 json.dumps(remote_status_payload()),
                 "application/json"
             )
+        elif url.path == "/api/settings":
+            self._send(
+                200,
+                json.dumps(remote_settings_payload()),
+                "application/json"
+            )
         else:
             self._send(404, "Não encontrado", "text/plain; charset=utf-8")
 
@@ -3790,52 +4121,119 @@ class RemoteHandler(BaseHTTPRequestHandler):
             return
 
         action = url.path.removeprefix("/api/")
-        if action in REMOTE_ACTIONS:
+
+        if action == "settings":
+            data = self._read_json()
+            if data is None:
+                clean, error = None, "Dados inválidos"
+            else:
+                clean, error = parse_remote_settings(data)
+
+            if error:
+                self._send(
+                    400,
+                    json.dumps({"ok": False, "error": error}),
+                    "application/json"
+                )
+            else:
+                if clean:
+                    queue_ui("remote_settings", clean)
+                self._send(200, '{"ok": true}', "application/json")
+
+        elif action in REMOTE_ACTIONS:
             queue_ui("remote", action)
             self._send(200, '{"ok": true}', "application/json")
+
         else:
             self._send(404, "Não encontrado", "text/plain; charset=utf-8")
 
 
-def start_remote_server():
-    global REMOTE_SERVER, REMOTE_TOKEN, REMOTE_URL
+def get_saved_remote_token():
+    """Token fixo do link: criado uma vez e guardado no config.json."""
+    global REMOTE_TOKEN_SAVED
+
+    if not REMOTE_TOKEN_SAVED:
+        REMOTE_TOKEN_SAVED = secrets.token_urlsafe(16)
+        try:
+            save_config()
+        except Exception as error:
+            log(f"Erro ao salvar o código do controle remoto: {error}")
+    return REMOTE_TOKEN_SAVED
+
+
+def start_remote_server(reuse_token=None):
+    global REMOTE_SERVER, REMOTE_THREAD, REMOTE_TOKEN, REMOTE_URL
+    global REMOTE_IP, REMOTE_PORT, REMOTE_PORT_BUSY
+    global REMOTE_LAST_SEEN, REMOTE_LOST_REASON
 
     if REMOTE_SERVER is not None:
         return True
 
+    refresh_remote_choices()
+
     server = None
+    busy_port = None
+
+    # Tenta a porta preferida; se outro programa já a usa, pega uma livre.
     for port in (REMOTE_PORT_PREFERRED, 0):
         try:
-            server = ThreadingHTTPServer(("0.0.0.0", port), RemoteHandler)
+            server = RemoteServer(("0.0.0.0", port), RemoteHandler)
             break
         except OSError as error:
-            log(f"Controle remoto: porta {port or 'automática'} indisponível ({error})")
+            log(
+                f"Controle remoto: porta {port or 'automática'} "
+                f"indisponível ({error})"
+            )
+            if port:
+                busy_port = port
 
     if server is None:
         return False
 
-    server.daemon_threads = True
-    REMOTE_TOKEN = secrets.token_urlsafe(16)
-    REMOTE_URL = (
-        f"http://{get_lan_ip()}:{server.server_address[1]}/?t={REMOTE_TOKEN}"
-    )
+    REMOTE_PORT_BUSY = busy_port
+    REMOTE_IP = get_lan_ip()
+    REMOTE_PORT = server.server_address[1]
+    REMOTE_TOKEN = reuse_token or get_saved_remote_token()
+    REMOTE_URL = f"http://{REMOTE_IP}:{REMOTE_PORT}/?t={REMOTE_TOKEN}"
+    REMOTE_LAST_SEEN = None
+    REMOTE_LOST_REASON = ""
     REMOTE_SERVER = server
 
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log(f"Controle remoto ativado na porta {server.server_address[1]}")
+    REMOTE_THREAD = threading.Thread(target=server.serve_forever, daemon=True)
+    REMOTE_THREAD.start()
+
+    schedule_remote_health()
+
+    if busy_port:
+        log(
+            f"Controle remoto ativado na porta {REMOTE_PORT} "
+            f"(a {busy_port} estava ocupada por outro programa)"
+        )
+    else:
+        log(f"Controle remoto ativado na porta {REMOTE_PORT}")
     return True
 
 
-def stop_remote_server():
-    global REMOTE_SERVER, REMOTE_TOKEN, REMOTE_URL
+def stop_remote_server(wait=False):
+    global REMOTE_SERVER, REMOTE_THREAD, REMOTE_TOKEN, REMOTE_URL
+    global REMOTE_HEALTH_JOB, REMOTE_LOST_REASON
 
     server = REMOTE_SERVER
     if server is None:
         return
 
     REMOTE_SERVER = None
+    REMOTE_THREAD = None
     REMOTE_TOKEN = None
     REMOTE_URL = ""
+    REMOTE_LOST_REASON = ""
+
+    if REMOTE_HEALTH_JOB is not None:
+        try:
+            root.after_cancel(REMOTE_HEALTH_JOB)
+        except Exception:
+            pass
+        REMOTE_HEALTH_JOB = None
 
     def _close():
         try:
@@ -3844,8 +4242,71 @@ def stop_remote_server():
         except Exception:
             pass
 
-    threading.Thread(target=_close, daemon=True).start()
+    closer = threading.Thread(target=_close, daemon=True)
+    closer.start()
+    if wait:
+        # Reconectar precisa da porta livre antes de abrir de novo.
+        closer.join(3.0)
+
     log("Controle remoto desativado")
+
+
+def reconnect_remote_server(new_token=None):
+    """Reinicia o servidor, atualiza o IP do QR e mantém o mesmo código
+    secreto (um celular com a página aberta volta sozinho se o IP não mudou)."""
+    token = new_token or (REMOTE_TOKEN if REMOTE_SERVER is not None else None)
+
+    if REMOTE_SERVER is not None:
+        stop_remote_server(wait=True)
+
+    ok = start_remote_server(reuse_token=token)
+    if ok:
+        log("Controle remoto: reconectado")
+    return ok
+
+
+def schedule_remote_health():
+    global REMOTE_HEALTH_JOB
+
+    if REMOTE_HEALTH_JOB is not None:
+        try:
+            root.after_cancel(REMOTE_HEALTH_JOB)
+        except Exception:
+            pass
+    REMOTE_HEALTH_JOB = root.after(1500, remote_health_tick)
+
+
+def remote_health_tick():
+    """Detecta servidor parado ou IP do PC diferente do que está no QR."""
+    global REMOTE_LOST_REASON, REMOTE_HEALTH_JOB
+
+    REMOTE_HEALTH_JOB = None
+    if REMOTE_SERVER is None:
+        return
+
+    reason = ""
+    if REMOTE_THREAD is not None and not REMOTE_THREAD.is_alive():
+        reason = "o servidor parou"
+    else:
+        current_ip = get_lan_ip()
+        if current_ip != REMOTE_IP:
+            reason = (
+                "o PC está sem rede"
+                if current_ip == "127.0.0.1"
+                else f"o IP do PC mudou ({REMOTE_IP} → {current_ip})"
+            )
+
+    if reason != REMOTE_LOST_REASON:
+        REMOTE_LOST_REASON = reason
+        if reason:
+            log(f"Controle remoto: conexão perdida — {reason}")
+
+    try:
+        refresh_remote_status()
+    except Exception:
+        pass
+
+    REMOTE_HEALTH_JOB = root.after(1500, remote_health_tick)
 
 
 def handle_remote_action(action):
@@ -3944,6 +4405,57 @@ def make_qr_photo(text, size=240):
         return None
 
 
+def remote_connection_state():
+    """Texto e cor do estado da conexão mostrado na janela do PC."""
+    if REMOTE_SERVER is None:
+        return "Desativado", "#ff7b72"
+
+    if REMOTE_LOST_REASON:
+        return (
+            f"Conexão perdida — {REMOTE_LOST_REASON}.\n"
+            "Toque em Reconectar e escaneie o QR de novo.",
+            "#ff7b72"
+        )
+
+    if REMOTE_LAST_SEEN is None:
+        return "Ativo — aguardando o celular (escaneie o QR)", "#f2cc60"
+
+    idle = int(time.time() - REMOTE_LAST_SEEN)
+    if idle <= REMOTE_CONTACT_TIMEOUT:
+        return "Celular conectado", "#7ee787"
+
+    waited = f"{idle}s" if idle < 60 else f"{idle // 60} min"
+    return (
+        f"Sem contato com o celular há {waited}.\n"
+        "Se ele não voltar sozinho, use Reconectar.",
+        "#f2cc60"
+    )
+
+
+def refresh_remote_status():
+    """Atualização leve (só textos); roda a cada ~1,5 s com o servidor ativo."""
+    widgets = remote_widgets
+
+    try:
+        if remote_window is None or not remote_window.winfo_exists():
+            return
+    except Exception:
+        return
+
+    text, color = remote_connection_state()
+    widgets["status"].configure(text=text, fg=color)
+
+    if REMOTE_SERVER is not None and REMOTE_PORT_BUSY:
+        widgets["info"].configure(
+            text=(
+                f"A porta {REMOTE_PORT_BUSY} está ocupada por outro programa. "
+                f"Usando a porta {REMOTE_PORT}."
+            )
+        )
+    else:
+        widgets["info"].configure(text="")
+
+
 def refresh_remote_window():
     widgets = remote_widgets
 
@@ -3953,44 +4465,124 @@ def refresh_remote_window():
     except Exception:
         return
 
+    refresh_remote_status()
+
     if REMOTE_SERVER is not None:
-        photo = make_qr_photo(REMOTE_URL)
-        widgets["status"].configure(
-            text="Ativo — escaneie com a câmera do celular",
-            fg="#7ee787"
-        )
         widgets["url"].configure(text=REMOTE_URL)
         widgets["toggle"].itemconfig(widgets["toggle_text"], text="Desativar")
 
-        if photo is not None:
-            widgets["qr"].configure(image=photo, text="")
-            widgets["qr"].image = photo
-        else:
-            widgets["qr"].configure(
-                image="",
-                text="QR indisponível.\nAbra o endereço abaixo no celular."
-            )
-            widgets["qr"].image = None
+        # Só refaz o QR quando o endereço mudou.
+        if widgets.get("qr_for") != REMOTE_URL:
+            photo = make_qr_photo(REMOTE_URL)
+            widgets["qr_for"] = REMOTE_URL
+
+            if photo is not None:
+                widgets["qr"].configure(image=photo, text="")
+                widgets["qr"].image = photo
+            else:
+                widgets["qr"].configure(
+                    image="",
+                    text="QR indisponível.\nAbra o endereço abaixo no celular."
+                )
+                widgets["qr"].image = None
     else:
-        widgets["status"].configure(text="Desativado", fg="#ff7b72")
+        widgets["qr_for"] = None
         widgets["url"].configure(text="-")
         widgets["qr"].configure(image="", text="Desativado")
         widgets["qr"].image = None
         widgets["toggle"].itemconfig(widgets["toggle_text"], text="Ativar")
 
 
+def apply_remote_port_entry():
+    """Lê a porta digitada na janela. Retorna False se for inválida."""
+    global REMOTE_PORT_PREFERRED
+
+    var = remote_widgets.get("port_var")
+    if var is None:
+        return True
+
+    try:
+        port = int(str(var.get()).strip())
+        if not 1024 <= port <= 65535:
+            raise ValueError
+    except ValueError:
+        var.set(str(REMOTE_PORT_PREFERRED))
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            "Porta inválida.\n\nUse um número entre 1024 e 65535.",
+            "GoW Overlay",
+            0x10
+        )
+        return False
+
+    if port != REMOTE_PORT_PREFERRED:
+        REMOTE_PORT_PREFERRED = port
+        try:
+            save_config()
+        except Exception as error:
+            log(f"Erro ao salvar a porta do controle remoto: {error}")
+        log(f"Porta preferida do controle remoto: {port}")
+
+    return True
+
+
+def show_remote_start_error():
+    ctypes.windll.user32.MessageBoxW(
+        0,
+        "Não foi possível iniciar o controle remoto.\n\n"
+        "Confira o log para detalhes.",
+        "GoW Overlay",
+        0x10
+    )
+
+
 def toggle_remote_server():
     if REMOTE_SERVER is not None:
         stop_remote_server()
     else:
+        if not apply_remote_port_entry():
+            return
         if not start_remote_server():
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "Não foi possível iniciar o controle remoto.\n\n"
-                "Confira o log para detalhes.",
-                "GoW Overlay",
-                0x10
-            )
+            show_remote_start_error()
+
+    refresh_remote_window()
+
+
+def new_remote_link_clicked():
+    """Gera outro código secreto (invalida o link/QR antigo)."""
+    global REMOTE_TOKEN_SAVED
+
+    answer = ctypes.windll.user32.MessageBoxW(
+        0,
+        "Gerar um novo link?\n\n"
+        "O link e o QR atuais deixam de funcionar. "
+        "Será preciso escanear o QR novo no celular.",
+        "GoW Overlay",
+        0x24
+    )
+    if answer != 6:
+        return
+
+    REMOTE_TOKEN_SAVED = secrets.token_urlsafe(16)
+    try:
+        save_config()
+    except Exception as error:
+        log(f"Erro ao salvar o código do controle remoto: {error}")
+    log("Controle remoto: novo link gerado")
+
+    if REMOTE_SERVER is not None:
+        if not reconnect_remote_server(new_token=REMOTE_TOKEN_SAVED):
+            show_remote_start_error()
+
+    refresh_remote_window()
+
+
+def reconnect_remote_clicked():
+    if not apply_remote_port_entry():
+        return
+
+    if not reconnect_remote_server():
+        show_remote_start_error()
 
     refresh_remote_window()
 
@@ -4024,10 +4616,10 @@ def open_remote():
     remote_window.withdraw()
     remote_window.configure(bg="#161618")
     remote_window.overrideredirect(True)
-    remote_window.attributes("-topmost", True)
+    remote_window.attributes("-topmost", ALWAYS_ON_TOP)
 
     remote_width = 440
-    remote_height = 640
+    remote_height = 860
 
     remote_x = max(
         0,
@@ -4080,9 +4672,22 @@ def open_remote():
         text="",
         bg="#161618",
         fg="#ff7b72",
-        font=("Segoe UI", 11, "bold")
+        font=("Segoe UI", 11, "bold"),
+        wraplength=400,
+        justify="center"
     )
-    remote_widgets["status"].pack(pady=(6, 8))
+    remote_widgets["status"].pack(pady=(6, 4))
+
+    remote_widgets["info"] = tk.Label(
+        remote_window,
+        text="",
+        bg="#161618",
+        fg="#f2cc60",
+        font=("Segoe UI", 9),
+        wraplength=400,
+        justify="center"
+    )
+    remote_widgets["info"].pack(pady=(0, 4))
 
     qr_holder = tk.Frame(remote_window, bg="#161618", width=250, height=250)
     qr_holder.pack()
@@ -4108,22 +4713,79 @@ def open_remote():
     )
     remote_widgets["url"].pack(padx=16, pady=(10, 8))
 
+    port_row = tk.Frame(remote_window, bg="#161618")
+    port_row.pack(pady=(0, 10))
+
+    tk.Label(
+        port_row,
+        text="Porta",
+        bg="#161618",
+        fg="#f4f4f5",
+        font=("Segoe UI", 9)
+    ).pack(side="left", padx=(0, 6))
+
+    remote_widgets["port_var"] = tk.StringVar(value=str(REMOTE_PORT_PREFERRED))
+    tk.Entry(
+        port_row,
+        textvariable=remote_widgets["port_var"],
+        width=7,
+        justify="center",
+        bg="#242426",
+        fg="#f4f4f5",
+        insertbackground="#f4f4f5",
+        relief="flat"
+    ).pack(side="left")
+
+    tk.Label(
+        port_row,
+        text="vale ao ativar/reconectar",
+        bg="#161618",
+        fg="#707075",
+        font=("Segoe UI", 8)
+    ).pack(side="left", padx=(8, 0))
+
+    buttons_row = tk.Frame(remote_window, bg="#161618")
+    buttons_row.pack(pady=(0, 12))
+
     toggle_button = make_round_button(
-        remote_window,
+        buttons_row,
         "Ativar",
         toggle_remote_server,
-        150
+        110
     )
     toggle_button.configure(bg="#161618")
-    toggle_button.pack(pady=(0, 12))
+    toggle_button.pack(side="left", padx=6)
     remote_widgets["toggle"] = toggle_button
     remote_widgets["toggle_text"] = toggle_button.find_all()[-1]
+
+    reconnect_button = make_round_button(
+        buttons_row,
+        "Reconectar",
+        reconnect_remote_clicked,
+        120
+    )
+    reconnect_button.configure(bg="#161618")
+    reconnect_button.pack(side="left", padx=6)
+    remote_widgets["reconnect"] = reconnect_button
+
+    new_link_button = make_round_button(
+        buttons_row,
+        "Novo link",
+        new_remote_link_clicked,
+        110
+    )
+    new_link_button.configure(bg="#161618")
+    new_link_button.pack(side="left", padx=6)
 
     make_rounded_note(
         remote_window,
         (
-            "O link contém um código secreto novo a cada ativação. "
-            "Não mostre este QR na live: esta janela fica fora da captura do OBS.\n\n"
+            "O link é fixo: o código secreto fica salvo e você pode favoritar a "
+            "página no celular. Quem tiver o link controla o overlay; se ele "
+            "vazar, use Novo link. Não mostre este QR na live: esta janela fica "
+            "fora da captura do OBS.\n\n"
+            "O link só muda se o IP do PC mudar. Para ele ficar sempre igual, "
+            "reserve o IP do PC no roteador (reserva de DHCP).\n\n"
             "Funciona só na mesma rede Wi-Fi do PC e usa HTTP sem criptografia. "
             "Evite redes públicas. Na primeira vez, permita o aplicativo no "
             "Firewall do Windows (rede privada)."
@@ -4751,7 +5413,7 @@ def show_dashboard_from_tray():
     dashboard_panel_visible = True
     try:
         dashboard.deiconify()
-        dashboard.attributes("-topmost", True)
+        dashboard.attributes("-topmost", ALWAYS_ON_TOP)
         dashboard.overrideredirect(True)
         dashboard.lift()
         dashboard.focus_force()
@@ -4832,6 +5494,9 @@ def process_ui_queue():
             elif kind == "remote":
                 handle_remote_action(value)
 
+            elif kind == "remote_settings":
+                apply_remote_settings(value)
+
             elif kind == "tray_dashboard":
                 show_dashboard_from_tray()
 
@@ -4857,6 +5522,16 @@ def process_ui_queue():
 # CONFIGURAÇÕES
 # =========================================================
 
+def apply_always_on_top():
+    """Aplica 'sempre por cima' às janelas do app que já existem."""
+    for window in (dashboard, settings_window, support_window, remote_window):
+        try:
+            if window is not None and window.winfo_exists():
+                window.attributes("-topmost", ALWAYS_ON_TOP)
+        except Exception:
+            pass
+
+
 def apply_settings(values, save=False, log_result=True):
     global MAX_MESSAGES
     global TEXT_OPACITY
@@ -4881,6 +5556,7 @@ def apply_settings(values, save=False, log_result=True):
     global F9_INITIAL_TIME
     global F9_REPEAT_TIME
     global ALWAYS_SHOW_OVERLAY
+    global ALWAYS_ON_TOP
     global AUTO_DELETE_MESSAGES
     global AUTO_DELETE_SECONDS
     global overlay_x
@@ -4893,6 +5569,7 @@ def apply_settings(values, save=False, log_result=True):
         previous_third_party_emotes = THIRD_PARTY_EMOTES
         previous_log_to_file = LOG_TO_FILE
         previous_emote_size = EMOTE_SIZE
+        previous_always_on_top = ALWAYS_ON_TOP
         MAX_MESSAGES = max(1, int(values["max_messages"].get()))
 
         TEXT_OPACITY = max(
@@ -4925,6 +5602,15 @@ def apply_settings(values, save=False, log_result=True):
         THIRD_PARTY_EMOTES = bool(values["third_party_emotes"].get())
         LOG_TO_FILE = bool(values["log_to_file"].get())
         SHOW_HINT = bool(values["show_hint"].get())
+        if "always_on_top" in values:
+            ALWAYS_ON_TOP = bool(values["always_on_top"].get())
+        if ALWAYS_ON_TOP != previous_always_on_top:
+            apply_always_on_top()
+            log(
+                "Janelas do app sempre por cima: ligado"
+                if ALWAYS_ON_TOP
+                else "Janelas do app sempre por cima: desligado"
+            )
         if CONTROL_DP != previous_control_dp:
             last_active = None
         AUTO_DELETE_SECONDS = max(
@@ -5023,6 +5709,7 @@ def apply_settings(values, save=False, log_result=True):
             "third_party_emotes": THIRD_PARTY_EMOTES,
             "log_to_file": LOG_TO_FILE,
             "show_hint": SHOW_HINT,
+            "always_on_top": ALWAYS_ON_TOP,
             "f9_initial_time": F9_INITIAL_TIME,
             "f9_repeat_time": F9_REPEAT_TIME,
             "always_show_overlay": ALWAYS_SHOW_OVERLAY,
@@ -5190,7 +5877,7 @@ def open_settings():
         f"{settings_width}x{settings_height}+{settings_x}+{settings_y}"
     )
     settings_window.resizable(False, False)
-    settings_window.attributes("-topmost", True)
+    settings_window.attributes("-topmost", ALWAYS_ON_TOP)
 
     settings_window.bind(
         "<FocusIn>",
@@ -6117,6 +6804,9 @@ def open_settings():
     show_hint_var = tk.BooleanVar(value=SHOW_HINT)
     values["show_hint"] = show_hint_var
 
+    always_on_top_var = tk.BooleanVar(value=ALWAYS_ON_TOP)
+    values["always_on_top"] = always_on_top_var
+
     options_grid = tk.Frame(settings_window, bg="#161618")
     options_grid.grid(
         row=len(fields) + 3,
@@ -6249,6 +6939,21 @@ def open_settings():
         sticky="w"
     )
 
+    always_on_top_option = make_circle_check(
+        options_grid,
+        "Janelas do app sempre por cima",
+        always_on_top_var,
+        bg="#161618",
+        fg="#f4f4f5"
+    )
+    always_on_top_option.grid(
+        row=4,
+        column=0,
+        padx=(0, 10),
+        pady=(10, 0),
+        sticky="w"
+    )
+
     def update_chat_dependent_options(*_):
         enabled = bool(show_chat_var.get())
         always_option._set_enabled(enabled)
@@ -6324,6 +7029,7 @@ def open_settings():
         )
         log_to_file_var.set(bool(defaults.get("log_to_file", True)))
         show_hint_var.set(bool(defaults.get("show_hint", True)))
+        always_on_top_var.set(bool(defaults.get("always_on_top", True)))
 
 
         # Não limpa messages.
@@ -6448,6 +7154,20 @@ def open_settings():
         )
 
     settings_window.update_idletasks()
+
+    # A opção nova ocupa mais uma linha: se o conteúdo passar da altura
+    # fixa, aumenta a janela para os botões de baixo não ficarem cortados.
+    needed_height = settings_window.winfo_reqheight()
+    if needed_height > settings_height:
+        settings_height = needed_height
+        settings_y = max(
+            0,
+            (settings_window.winfo_screenheight() - settings_height) // 2
+        )
+        settings_window.geometry(
+            f"{settings_width}x{settings_height}+{settings_x}+{settings_y}"
+        )
+        settings_window.update_idletasks()
 
     settings_hwnd, protected = exclude_from_capture(
         settings_window
@@ -6602,7 +7322,7 @@ def check_hotkeys():
                 dashboard.deiconify()
                 dashboard.attributes(
                     "-topmost",
-                    True
+                    ALWAYS_ON_TOP
                 )
                 dashboard.overrideredirect(True)
                 dashboard.lift()
