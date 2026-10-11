@@ -16,11 +16,9 @@ GoW Overlay is a Windows utility that combines a Twitch chat overlay with automa
 - Supports multiple monitors and proportionally scales the overlay from a 1920×1080 reference layout.
 - Includes configurable font, opacity, spacing, dimensions, position and message behavior.
 - Keeps the Settings and Live Control windows out of OBS capture when supported by Windows.
-- Optional phone remote control: scan a QR code (same Wi-Fi) to clear messages and toggle options from a web page.
-- Shows an optional, nearly transparent shortcut hint in the corner of the screen (excluded from OBS capture) that can be turned off in Settings.
-- Reconnects to Twitch automatically if the connection drops.
-- Saves an optional event log for troubleshooting (one file per run, 10 most recent kept).
+- Optional phone remote control: scan a QR code (same Wi-Fi) to clear messages, toggle options and change every Settings option from a web page. The link is fixed (the secret code is saved; **New link** generates another). The remote window has a configurable port (automatically switched if another program is using it) and a **Reconnect** button that refreshes the QR code if the connection is lost or the PC's IP changes.
 - Provides a system-tray icon with quick access to Live Control, Settings and Exit.
+- Option to keep the app windows (Live Control, Settings, Support, Remote) always on top of other windows, or let them behave like normal windows.
 
 ### Requirements
 
@@ -45,20 +43,6 @@ Automatic OBS control can be disabled in the application settings. The Twitch ch
 | `F9` | Remove chat messages |
 | `F10` | Open Settings |
 | `F11` | Show or hide Live Control |
-
-### Phone remote control
-
-Click **Remote** in Live Control and then **Enable** to show a QR code. Scan it with your phone (same Wi-Fi network as the PC) to open a web page with buttons to clear messages and toggle "Always show messages" and automatic DP/OBS control, plus connection status.
-
-- It is off by default and only runs while enabled.
-- The link contains a random secret token that changes every time it is enabled; requests without it are refused.
-- It uses plain HTTP on the local network. Avoid public or shared networks.
-- Windows Firewall may ask for permission the first time; allow private networks.
-- Chat content and Twitch tokens are never sent to the phone.
-
-### Logs
-
-When enabled in Settings, the app writes an event log to `%LOCALAPPDATA%\GoW Overlay\Logs\`, one file per run (`overlay_YYYY-MM-DD_HH-MM-SS.log`), keeping the 10 most recent. The log includes chat messages and events, and stays only on your computer.
 
 ### Building from source
 
@@ -121,11 +105,9 @@ O GoW Overlay é um utilitário para Windows que combina um overlay do chat da T
 - Suporta vários monitores e redimensiona proporcionalmente o overlay a partir de um layout-base de 1920×1080.
 - Permite configurar fonte, opacidade, espaçamento, dimensões, posição e comportamento das mensagens.
 - Mantém as janelas de Configurações e Live Control fora da captura do OBS quando o Windows oferece suporte.
-- Controle remoto opcional pelo celular: escaneie um QR code (mesma rede Wi-Fi) para limpar mensagens e alternar opções por uma página web.
-- Exibe uma dica de atalhos opcional, quase transparente, no canto da tela (fora da captura do OBS), que pode ser desligada nas Configurações.
-- Reconecta automaticamente à Twitch se a conexão cair.
-- Salva um log de eventos opcional para diagnóstico (um arquivo por uso, mantendo os 10 mais recentes).
+- Controle remoto opcional pelo celular: escaneie um QR code (mesma rede Wi-Fi) para limpar mensagens, alternar opções e alterar todas as opções das Configurações por uma página web. O link é fixo (o código secreto fica salvo; **Novo link** gera outro). A janela Remoto tem porta configurável (trocada automaticamente se outro programa estiver usando) e um botão **Reconectar** que atualiza o QR code caso a conexão seja perdida ou o IP do PC mude.
 - Oferece um ícone na bandeja do sistema, com acesso rápido ao Live Control, às Configurações e à opção Sair.
+- Opção para manter as janelas do app (Live Control, Configurações, Suporte e Remoto) sempre por cima das outras ou deixá-las se comportar como janelas normais.
 
 ### Requisitos
 
@@ -150,20 +132,6 @@ O controle automático do OBS pode ser desativado nas Configurações. A exibiç
 | `F9` | Remove mensagens do chat |
 | `F10` | Abre as Configurações |
 | `F11` | Mostra ou oculta o Live Control |
-
-### Controle remoto pelo celular
-
-Clique em **Remoto** no Live Control e depois em **Ativar** para exibir um QR code. Escaneie com o celular (na mesma rede Wi-Fi do PC) para abrir uma página com botões para limpar mensagens e alternar "Sempre mostrar mensagens" e o controle automático do DP/OBS, além do status das conexões.
-
-- Vem desligado por padrão e só funciona enquanto estiver ativado.
-- O link contém um código secreto aleatório que muda a cada ativação; pedidos sem ele são recusados.
-- Usa HTTP simples na rede local. Evite redes públicas ou compartilhadas.
-- O Firewall do Windows pode pedir permissão na primeira vez; permita redes privadas.
-- O conteúdo do chat e os tokens da Twitch nunca são enviados ao celular.
-
-### Logs
-
-Quando ativado nas Configurações, o aplicativo grava um log de eventos em `%LOCALAPPDATA%\GoW Overlay\Logs\`, um arquivo por uso (`overlay_AAAA-MM-DD_HH-MM-SS.log`), mantendo os 10 mais recentes. O log inclui mensagens do chat e eventos e fica somente no seu computador.
 
 ### Compilação pelo código-fonte
 
@@ -216,8 +184,6 @@ This project is licensed under the MIT License.
 
 Este projeto é distribuído sob a licença MIT.
 
-## Code signing status / Assinatura de código
+## Code signing status
 
-**English:** The SignPath Foundation application for free code signing was not approved, so release artifacts are unsigned. Because of this, Windows SmartScreen may show a "Windows protected your PC" warning when you first run `GoW Overlay.exe`; this is expected for unsigned apps and does not by itself mean the file is unsafe. The full source code is in this repository, and the executable is built from it with the included `build.ps1` and the GitHub Actions workflow, so you can review the code and build it yourself. Only download releases from this repository.
-
-**Português:** A solicitação de assinatura de código gratuita da SignPath Foundation não foi aprovada, portanto os arquivos publicados não são assinados. Por isso, o Windows SmartScreen pode exibir o aviso "O Windows protegeu seu computador" ao abrir o `GoW Overlay.exe` pela primeira vez; isso é esperado em aplicativos sem assinatura e, por si só, não significa que o arquivo seja inseguro. Todo o código-fonte está neste repositório e o executável é gerado a partir dele com o `build.ps1` incluído e o fluxo de trabalho do GitHub Actions, então você pode revisar o código e compilar por conta própria. Baixe os arquivos somente deste repositório.
+Current release artifacts are unsigned. The SignPath Foundation application may be resubmitted after the project gains broader public adoption.
