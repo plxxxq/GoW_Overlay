@@ -24,7 +24,7 @@ New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 New-Item -ItemType Directory -Force -Path $specDir | Out-Null
 
-py -m pip install --upgrade pyinstaller requests websocket-client pywin32 obsws-python pystray pillow
+py -m pip install --upgrade pyinstaller requests websocket-client pywin32 obsws-python pystray pillow qrcode
 
 py -m PyInstaller `
     --onefile `
@@ -38,6 +38,7 @@ py -m PyInstaller `
     --hidden-import pystray `
     --hidden-import pystray._win32 `
     --hidden-import PIL `
+    --hidden-import qrcode `
     --distpath $outputDir `
     --workpath $buildDir `
     --specpath $specDir `
